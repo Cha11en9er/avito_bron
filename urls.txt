@@ -1,0 +1,7 @@
+# Список ссылок на дома с Авито. По одной ссылке в строке. Пустые строки и строки, начинающиеся с #, игнорируются.
+https://www.avito.ru/dorohovo/doma_dachi_kottedzhi/1-k._dom_50_m_7899516751
+https://www.avito.ru/tuchkovo/doma_dachi_kottedzhi/3-k._dom_75_m_2669005230
+https://www.avito.ru/uvarovka/doma_dachi_kottedzhi/4-k._dom_90_m_7637434146
+https://www.avito.ru/uvarovka/doma_dachi_kottedzhi/4-k._dom_98_m_7571596546
+https://www.avito.ru/uvarovka/doma_dachi_kottedzhi/3-k._dom_895_m_7571008125
+https://www.avito.ru/mozhaysk/doma_dachi_kottedzhi/2-k._dom_63_m_3995152260
