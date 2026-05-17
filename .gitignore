@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Google Sheets: JSON ключа сервисного аккаунта (путь задаётся в .env, файл не коммитить)
+google-service-account.json
+service_account.json

@@ -10,19 +10,20 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 import ddddocr
 from PIL import Image, ImageOps
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from playwright.sync_api import sync_playwright
 from playwright_stealth.stealth import Stealth
 
 NAV_TIMEOUT_MS = 90000
-ON_PAGE_BASE_WAIT_S = 8
+# Как в avito-parser-exactly.py: после domcontentloaded даём SPA/стилям время (сек.).
+POST_GOTO_WAIT_S = 30
 BETWEEN_SITES_PAUSE_S = 30
 URLS_FILE_NAME = "urls.txt"
 OUTPUT_DIR_NAME = "avito_houses_dump"
-RESULTS_FILE_NAME = "avito_houses_results.json"
 RESULTS_XLSX_FILE_NAME = "дома авито.xlsx"
 NOT_FOUND_VALUE = "нету на сайте"
 PHONE_NOT_RECOGNIZED = "не распознан"
@@ -53,18 +54,9 @@ HOUSE_FIELD_KEYWORDS: dict[str, list[str]] = {
     "год постройки":   ["год постройки"],
 }
 
+# Как в 24.04.26-avito / avito-parser-exactly.py — только разворот окна, без лишних флагов.
 CHROME_ARGS = [
     "--start-maximized",
-    "--disable-blink-features=AutomationControlled",
-    "--disable-dev-shm-usage",
-    "--no-first-run",
-    "--disable-features=IsolateOrigins,site-per-process",
-]
-
-HUMAN_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
 
@@ -88,6 +80,7 @@ def _console_utf8() -> None:
 
 
 def _launch_browser(playwright):
+    """Как в avito-parser-exactly.py: системный Chrome, при отсутствии — bundled Chromium."""
     try:
         return playwright.chromium.launch(channel="chrome", headless=False, args=CHROME_ARGS)
     except Exception:
@@ -95,42 +88,19 @@ def _launch_browser(playwright):
 
 
 def _new_page(browser):
-    user_agent = random.choice(HUMAN_USER_AGENTS)
-    viewport_w = random.choice([1920, 1912, 1904])
-    viewport_h = random.choice([1080, 1032, 1040, 1008])
+    """Контекст + stealth как в avito-parser-exactly.py (viewport 1920×1080, ru, Москва)."""
     context = browser.new_context(
-        viewport={"width": viewport_w, "height": viewport_h},
-        user_agent=user_agent,
+        viewport={"width": 1920, "height": 1080},
         locale="ru-RU",
         timezone_id="Europe/Moscow",
-        color_scheme="light",
-        device_scale_factor=1,
     )
-    try:
-        stealth = Stealth(
-            navigator_languages_override=("ru-RU", "ru", "en-US", "en"),
-            navigator_platform_override="Win32",
-            webgl_vendor_override="Intel Inc.",
-            webgl_renderer_override="Intel Iris OpenGL Engine",
-            navigator_user_agent_override=user_agent,
-        )
-    except TypeError:
-        # Совместимость со старыми версиями playwright-stealth.
-        stealth = Stealth(
-            navigator_languages_override=("ru-RU", "ru", "en-US", "en"),
-            navigator_platform_override="Win32",
-            webgl_vendor_override="Intel Inc.",
-            webgl_renderer_override="Intel Iris OpenGL Engine",
-        )
+    stealth = Stealth(
+        navigator_languages_override=("ru-RU", "ru", "en-US", "en"),
+        navigator_platform_override="Win32",
+        webgl_vendor_override="Intel Inc.",
+        webgl_renderer_override="Intel Iris OpenGL Engine",
+    )
     stealth.apply_stealth_sync(context)
-    context.set_extra_http_headers(
-        {
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-CH-UA-Platform": '"Windows"',
-            "Sec-CH-UA-Mobile": "?0",
-        }
-    )
     page = context.new_page()
     page.set_default_navigation_timeout(NAV_TIMEOUT_MS)
     page.set_default_timeout(25000)
@@ -152,6 +122,112 @@ def _simulate_human_activity(page) -> None:
             _human_pause(page, 0.1, 0.35)
     except Exception:
         pass
+
+
+def _rewrite_css_urls(css: str, stylesheet_url: str) -> str:
+    """Делает относительные url(...) в CSS абсолютными (нужно для инлайна стилей)."""
+    base_p = urlparse(stylesheet_url)
+
+    def repl(match: re.Match[str]) -> str:
+        full = match.group(0)
+        inner_raw = match.group(1).strip()
+        inner = inner_raw.strip()
+        quote = ""
+        if len(inner) >= 2 and inner[0] in "'\"" and inner[-1] == inner[0]:
+            quote = inner[0]
+            inner = inner[1:-1].strip()
+        u = inner
+        if not u or u.startswith("data:") or u.startswith("#"):
+            return full
+        if u.startswith(("http://", "https://")):
+            return full
+        if u.startswith("//"):
+            scheme = base_p.scheme or "https"
+            resolved = f"{scheme}:{u}"
+        elif u.startswith("/"):
+            resolved = f"{base_p.scheme}://{base_p.netloc}{u}"
+        else:
+            resolved = urljoin(stylesheet_url, u)
+        if quote:
+            return f"url({quote}{resolved}{quote})"
+        return f"url({resolved})"
+
+    return re.sub(r"url\(\s*([^)]+)\s*\)", repl, css, flags=re.IGNORECASE)
+
+
+def _inline_external_stylesheets(page) -> None:
+    """
+    Добавляет в <head> копию всех внешних CSS как один <style> (для офлайн-просмотра дампа).
+
+    Важно: оригинальные <link rel="stylesheet"> не трогаем — иначе в окне Playwright
+    страница теряет стили до перезагрузки (и порядок подключения ломается).
+    """
+    hrefs: list[str] = page.evaluate(
+        """() => {
+            const out = [];
+            for (const link of document.querySelectorAll('link[rel="stylesheet"][href]')) {
+                out.push(link.href);
+            }
+            return out;
+        }"""
+    )
+    if not hrefs:
+        return
+
+    ordered_unique: list[str] = []
+    seen: set[str] = set()
+    for h in hrefs:
+        if h not in seen:
+            seen.add(h)
+            ordered_unique.append(h)
+
+    referer = str(page.url) if page.url else "https://www.avito.ru/"
+    req_headers = {
+        "Referer": referer,
+        "Accept": "text/css,*/*;q=0.1",
+    }
+
+    chunks: list[str] = []
+    for href in ordered_unique:
+        try:
+            response = page.request.get(href, timeout=25000, headers=req_headers)
+            if not response.ok:
+                continue
+            css = response.text()
+            css = _rewrite_css_urls(css, href)
+            chunks.append(f"/* source: {href} */\n{css}\n")
+        except Exception:
+            continue
+
+    if not chunks:
+        return
+
+    bundle = "\n".join(chunks)
+    page.evaluate(
+        """(cssText) => {
+            for (const old of document.querySelectorAll("style[data-avito-dump-inlined]")) {
+                old.remove();
+            }
+            const tag = document.createElement("style");
+            tag.setAttribute("data-avito-dump-inlined", "1");
+            tag.textContent = cssText;
+            document.head.appendChild(tag);
+        }""",
+        bundle,
+    )
+
+
+def _wait_for_item_spa_ready(page, idx: int, total: int) -> None:
+    """Ждём, пока карточка объявления отрисуется (а не дефолтная оболочка Авито)."""
+    selectors = (
+        '[data-marker="item-view/item-price"], '
+        'h1[itemprop="name"], '
+        '[data-marker="item-view/title-info"] h1'
+    )
+    try:
+        page.locator(selectors).first.wait_for(state="visible", timeout=65000)
+    except Exception as exc:
+        print(f"[{idx}/{total}] Предупреждение: долго не появлялась карточка объявления: {exc}")
 
 
 def _scroll_through_page(page, total_scrolls: int = 6) -> None:
@@ -212,22 +288,42 @@ def _extract_id_from_url(url: str) -> int | None:
     return None
 
 
-def _load_existing_results(base_dir: Path) -> list[dict]:
-    results_path = base_dir / RESULTS_FILE_NAME
-    if not results_path.exists():
+def _load_results_from_excel(base_dir: Path) -> list[dict]:
+    """Подхватываем уже сохранённые строки из Excel, чтобы новый прогон их не затирал."""
+    out_path = base_dir / RESULTS_XLSX_FILE_NAME
+    if not out_path.exists():
         return []
     try:
-        with open(results_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
+        wb = load_workbook(out_path, read_only=True, data_only=True)
     except Exception:
         return []
-
-
-def _write_results(base_dir: Path, payload: list[dict]) -> None:
-    results_path = base_dir / RESULTS_FILE_NAME
-    with open(results_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    try:
+        ws = wb.active
+        it = ws.iter_rows(values_only=True)
+        header_row = next(it, None)
+        if not header_row:
+            return []
+        header = [str(c).strip() if c is not None else "" for c in header_row]
+        col_index = {name: i for i, name in enumerate(header)}
+        out: list[dict] = []
+        for row in it:
+            if not row:
+                continue
+            rec: dict[str, str] = {}
+            for col in EXPORT_COLUMNS:
+                i = col_index.get(col)
+                if i is not None and i < len(row):
+                    v = row[i]
+                    rec[col] = "" if v is None else str(v).strip()
+                else:
+                    rec[col] = ""
+            if _normalize_space(rec.get("ссылка", "")):
+                out.append(rec)
+        return out
+    except Exception:
+        return []
+    finally:
+        wb.close()
 
 
 def _write_excel(base_dir: Path, payload: list[dict]) -> None:
@@ -239,31 +335,6 @@ def _write_excel(base_dir: Path, payload: list[dict]) -> None:
     for row in payload:
         ws.append([row.get(col, "") for col in EXPORT_COLUMNS])
     wb.save(out_path)
-
-
-def _is_record_quality_good(record: dict) -> bool:
-    """
-    "Хорошая" запись = хотя бы одно из ключевых полей реально извлечено.
-    Заглушки `нету на сайте` / `не распознан` считаем признаком капчи/ошибки.
-    """
-    link = _normalize_space(str(record.get("ссылка", "")))
-    if not link:
-        return False
-    placeholders = {NOT_FOUND_VALUE, PHONE_NOT_RECOGNIZED, ""}
-    key_fields = [
-        "название",
-        "цена",
-        "адрес",
-        "телефон",
-        "площадь дома",
-        "площадь участка",
-        "описание",
-    ]
-    for field in key_fields:
-        val = _normalize_space(str(record.get(field, "")))
-        if val and val not in placeholders:
-            return True
-    return False
 
 
 def _extract_title(page) -> str:
@@ -475,23 +546,21 @@ def _process_one_url(
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     _human_pause(page, 1.5, 4.0)
     _simulate_human_activity(page)
-    dynamic_wait = ON_PAGE_BASE_WAIT_S + random.randint(2, 8)
-    print(f"[{idx}/{total}] Жду {dynamic_wait} сек., затем прокручиваю страницу...")
-    page.wait_for_timeout(dynamic_wait * 1000)
+    _wait_for_item_spa_ready(page, idx, total)
+    print(f"[{idx}/{total}] Жду {POST_GOTO_WAIT_S} сек. (как в avito-parser-exactly.py), затем прокручиваю страницу...")
+    page.wait_for_timeout(POST_GOTO_WAIT_S * 1000)
     _scroll_through_page(page, total_scrolls=random.randint(5, 8))
     _simulate_human_activity(page)
     _human_pause(page, 1.0, 2.5)
+    try:
+        page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
 
     title = _extract_title(page) or f"house_{item_id}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     file_name = f"{item_id}_{_safe_slug(title)}_{timestamp}.html"
     html_path = output_dir / file_name
-    try:
-        html_content = page.content()
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-    except Exception as exc:
-        print(f"[{idx}/{total}] id={item_id} Не удалось сохранить HTML: {exc}")
 
     try:
         phone_image_path = _save_phone_image_from_popup(
@@ -539,6 +608,15 @@ def _process_one_url(
         "характеристики": _or_not_found(json.dumps(details, ensure_ascii=False)) if details else NOT_FOUND_VALUE,
         "ссылка": url,
     }
+
+    try:
+        _inline_external_stylesheets(page)
+        html_content = page.content()
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+    except Exception as exc:
+        print(f"[{idx}/{total}] id={item_id} Не удалось сохранить HTML: {exc}")
+
     print(f"[{idx}/{total}] Сохранено: {html_path.name}")
     return record
 
@@ -553,12 +631,7 @@ def main() -> None:
     urls = _load_urls(base_dir)
     print(f"К обработке {len(urls)} ссылок.")
 
-    results: list[dict] = _load_existing_results(base_dir)
-    processed_links_ok = {
-        _normalize_space(str(item.get("ссылка", "")))
-        for item in results
-        if isinstance(item, dict) and _is_record_quality_good(item)
-    }
+    results: list[dict] = _load_results_from_excel(base_dir)
 
     with sync_playwright() as p:
         browser = _launch_browser(p)
@@ -567,10 +640,6 @@ def main() -> None:
             total = len(urls)
             first_visit = True
             for idx, url in enumerate(urls, start=1):
-                if url in processed_links_ok:
-                    print(f"[{idx}/{total}] Уже обработано хорошо, пропускаю: {url}")
-                    continue
-
                 if not first_visit:
                     pause_s = BETWEEN_SITES_PAUSE_S + random.randint(0, 10)
                     print(f"[{idx}/{total}] Пауза между сайтами: {pause_s} сек.")
@@ -599,20 +668,18 @@ def main() -> None:
                 if not replaced:
                     results.append(record)
 
-                if _is_record_quality_good(record):
-                    processed_links_ok.add(url)
-
-                _write_results(base_dir, results)
                 _write_excel(base_dir, results)
 
-            print(f"JSON сохранён: {base_dir / RESULTS_FILE_NAME}")
             print(f"Excel сохранён: {base_dir / RESULTS_XLSX_FILE_NAME}")
         finally:
             try:
                 context.close()
             except Exception:
                 pass
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

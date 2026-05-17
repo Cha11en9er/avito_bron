@@ -1,0 +1,47 @@
+{
+   "checksum": "95a28d67d5cd19c9663301805a43624f",
+   "roots": {
+      "bookmark_bar": {
+         "children": [  ],
+         "date_added": "13423178189588636",
+         "date_last_used": "0",
+         "date_modified": "0",
+         "guid": "0bc5d13f-2cba-5d74-951f-3f233fe6c908",
+         "id": "1",
+         "name": "Панель закладок",
+         "type": "folder"
+      },
+      "other": {
+         "children": [ {
+            "date_added": "13423178213817762",
+            "date_last_used": "0",
+            "guid": "b3c84aba-dc41-47b1-927c-45d8640ee640",
+            "id": "5",
+            "meta_info": {
+               "power_bookmark_meta": ""
+            },
+            "name": "13",
+            "type": "url",
+            "url": "https://www.avito.ru/dorohovo/doma_dachi_kottedzhi/1-k._dom_50_m_7899516751"
+         } ],
+         "date_added": "13423178189588636",
+         "date_last_used": "0",
+         "date_modified": "13423178213817762",
+         "guid": "82b081ec-3dd3-529c-8475-ab6c344590dd",
+         "id": "2",
+         "name": "Другие закладки",
+         "type": "folder"
+      },
+      "synced": {
+         "children": [  ],
+         "date_added": "13423178189588636",
+         "date_last_used": "0",
+         "date_modified": "0",
+         "guid": "4cf2e351-0e85-532b-bb37-df045d8f8d0f",
+         "id": "3",
+         "name": "Мобильные закладки",
+         "type": "folder"
+      }
+   },
+   "version": 1
+}
