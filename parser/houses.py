@@ -10,6 +10,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
+from parser.paths import project_root
 from urllib.parse import urljoin, urlparse
 
 import ddddocr
@@ -64,7 +65,7 @@ def _setup_playwright_env() -> None:
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent
     else:
-        base = Path(__file__).resolve().parent
+        base = project_root()
     bundled = base / "ms-playwright"
     if bundled.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
@@ -624,7 +625,7 @@ def _process_one_url(
 def main() -> None:
     _setup_playwright_env()
 
-    base_dir = Path(__file__).resolve().parent
+    base_dir = project_root()
     output_dir = base_dir / OUTPUT_DIR_NAME
     output_dir.mkdir(parents=True, exist_ok=True)
 

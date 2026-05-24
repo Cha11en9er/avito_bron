@@ -10,6 +10,7 @@ import sys
 import time
 import traceback
 from datetime import datetime
+from typing import Any
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -18,19 +19,27 @@ from PIL import Image, ImageOps
 from playwright.sync_api import sync_playwright
 from playwright_stealth.stealth import Stealth
 
+from parser.paths import project_root
+
+try:
+    from google_sheets import is_listing_removed
+except ImportError:
+    def is_listing_removed(title: str, record: dict | None = None) -> bool:  # type: ignore[misc]
+        return "не посмотреть" in (title or "").lower()
+
 NAV_TIMEOUT_MS = 90000
-# Сумма фаз на карточке (сек.): пауза 3–8 + скролл 2–3 + блок брони 8–10 + финал 3–5 ≲ 26 + мелкие паузы.
-INITIAL_WAIT_MIN_S = 3.0
-INITIAL_WAIT_MAX_S = 8.0
-LIGHT_SCROLL_PHASE_MIN_S = 2.0
-LIGHT_SCROLL_PHASE_MAX_S = 3.0
+# Сумма фаз на карточке (сек.): пауза 1–2.5 + скролл 1.5–2 + бронь до 9 + финал 1–2 ≈ 18–20.
+INITIAL_WAIT_MIN_S = 1.0
+INITIAL_WAIT_MAX_S = 2.5
+LIGHT_SCROLL_PHASE_MIN_S = 1.5
+LIGHT_SCROLL_PHASE_MAX_S = 2.0
 BOOKING_PHASE_MIN_S = 8.0
-BOOKING_PHASE_MAX_S = 10.0
-FINAL_SCROLL_MIN_S = 3.0
-FINAL_SCROLL_MAX_S = 5.0
+BOOKING_PHASE_MAX_S = 9.0
+FINAL_SCROLL_MIN_S = 1.0
+FINAL_SCROLL_MAX_S = 2.0
 BOOKING_LOADER_CLICKS = 4
-BOOKING_CLICK_PAUSE_MS_MIN = 450
-BOOKING_CLICK_PAUSE_MS_MAX = 1100
+BOOKING_CLICK_PAUSE_MS_MIN = 400
+BOOKING_CLICK_PAUSE_MS_MAX = 750
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
 BROWSER_RESTART_EVERY = 10
 URLS_FILE_NAME = "urls.txt"
@@ -112,7 +121,7 @@ def _setup_playwright_env() -> None:
     if getattr(sys, "frozen", False):
         base = Path(sys.executable).resolve().parent
     else:
-        base = Path(__file__).resolve().parent
+        base = project_root()
     bundled = base / "ms-playwright"
     if bundled.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(bundled)
@@ -163,11 +172,11 @@ def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> No
 def _simulate_human_activity(page) -> None:
     # Лёгкие случайные движения мышью — убираем "идеально ровный" машинный паттерн.
     try:
-        for _ in range(random.randint(2, 4)):
+        for _ in range(random.randint(2, 3)):
             x = random.randint(100, 1200)
             y = random.randint(120, 760)
             page.mouse.move(x, y, steps=random.randint(8, 20))
-            _human_pause(page, 0.1, 0.35)
+            _human_pause(page, 0.08, 0.22)
     except Exception:
         pass
 
@@ -270,8 +279,16 @@ def _slot_period_label(text: str, data_id: str) -> str:
     return data_id
 
 
+def _slot_is_booked(text: str, price: str) -> bool:
+    """С ₽ — свободно; без цены (или «занято») — есть бронь."""
+    if price:
+        return False
+    t = (text or "").lower()
+    return "занят" in t or "недоступ" in t or True
+
+
 def _read_booking_slots(page) -> dict[str, tuple[str, str]]:
-    """data_id -> (подпись периода, цена с ₽), только ячейки с видимой ценой."""
+    """data_id -> (подпись периода, цена ₽ или маркер занятости)."""
     rows = page.evaluate(
         """() => {
             const root = document.querySelector('[data-marker="nearest-dates"]');
@@ -292,11 +309,16 @@ def _read_booking_slots(page) -> dict[str, tuple[str, str]]:
     for row in rows:
         did = str(row.get("dataId") or "").strip()
         text = str(row.get("text") or "")
-        price = _slot_price_display(text)
-        if not did or not price:
+        if not did:
             continue
         label = _slot_period_label(text, did)
-        out[did] = (label, price)
+        price = _slot_price_display(text)
+        if _slot_is_booked(text, price):
+            from google_sheets.constants import BOOKED_SLOT_MARKER
+
+            out[did] = (label, BOOKED_SLOT_MARKER)
+        else:
+            out[did] = (label, price)
     return out
 
 
@@ -344,20 +366,15 @@ def _collect_booking_prices_with_loaders(page, phase_deadline: float) -> dict[st
             pause_ms = min(pause_ms, max(120, remaining_ms - 80))
         page.wait_for_timeout(pause_ms)
         acc = _merge_booking_dicts(acc, _read_booking_slots(page))
-    while time.monotonic() < phase_deadline:
-        _micro_scroll_nudge(page)
-        if time.monotonic() >= phase_deadline:
-            break
-        page.wait_for_timeout(80)
     return acc
 
 
 def _booking_prices_to_dict(by_id: dict[str, tuple[str, str]]) -> dict[str, str]:
-    """Один объект JSON: период → цена, порядок по data-id (хронология)."""
+    """Период → цена или BOOKED_SLOT_MARKER. Ключ ISO data-id."""
     items = sorted(by_id.items(), key=lambda x: x[0])
     out: dict[str, str] = {}
     for did, (label, price) in items:
-        key = label if label else did
+        key = did if "--" in did and did[:4].isdigit() else (label if label else did)
         if key in out and out[key] != price:
             key = f"{key} ({did})"
         out[key] = price
@@ -380,38 +397,29 @@ def _normalize_multiline(value: str) -> str:
     return "\n".join(line for line in lines if line).strip()
 
 
-def _load_urls(base_dir: Path) -> list[str]:
+def _load_urls(base_dir: Path) -> tuple[Any, Any, list[str], int, int]:
     try:
-        from avito_google_sheet import (
-            bootstrap_google_sheet_mode,
-            filter_urls_needing_parse,
-            is_google_sheet_enabled,
-            load_urls_from_links_sheet,
-        )
+        from google_sheets import bootstrap_google_sheet_mode, is_google_sheet_enabled, prepare_parse_session
     except ImportError:
         bootstrap_google_sheet_mode = None  # type: ignore[assignment,misc]
         is_google_sheet_enabled = lambda: False  # noqa: E731
-        load_urls_from_links_sheet = None  # type: ignore[assignment]
-        filter_urls_needing_parse = None  # type: ignore[assignment]
+        prepare_parse_session = None  # type: ignore[assignment]
 
     if bootstrap_google_sheet_mode is not None:
         mode = bootstrap_google_sheet_mode(base_dir)
         if mode == "sheet":
-            print("Режим: Google Таблица (очередь — без «название» на «детальная информация»).")
+            print("Режим: Google Таблица (настройки — лист «настройки»).")
         else:
             print(
-                f"Режим: файл {URLS_FILE_NAME} (не Google Таблица). "
-                "Для таблицы укажите AVITO_GOOGLE_SHEET=1 в .env или положите service_account.json."
+                f"Режим: файл {URLS_FILE_NAME}. "
+                "Для таблицы укажите AVITO_GOOGLE_SHEET=1 или положите service_account.json."
             )
 
     if is_google_sheet_enabled():
-        if load_urls_from_links_sheet is None or filter_urls_needing_parse is None:
-            raise RuntimeError(
-                "AVITO_GOOGLE_SHEET=1, но не удалось импортировать avito_google_sheet "
-                "(pip install -r requirements.txt)"
-            )
-        urls_from_links = load_urls_from_links_sheet(base_dir)
-        return filter_urls_needing_parse(base_dir, urls_from_links)
+        if prepare_parse_session is None:
+            raise RuntimeError("AVITO_GOOGLE_SHEET=1, но пакет google_sheets недоступен.")
+        sh, settings, queue, start_offset, full_len = prepare_parse_session(base_dir, EXPORT_COLUMNS)
+        return sh, settings, queue, start_offset, full_len
 
     urls_path = base_dir / URLS_FILE_NAME
     if not urls_path.exists():
@@ -435,7 +443,7 @@ def _load_urls(base_dir: Path) -> list[str]:
         f"ВНИМАНИЕ: берутся только {len(urls)} ссылок из {URLS_FILE_NAME}, "
         "а не из Google Таблицы. Данные в таблице не обновятся."
     )
-    return urls
+    return None, None, urls, 0, len(urls)
 
 
 def _extract_id_from_url(url: str) -> int | None:
@@ -827,6 +835,26 @@ def _or_not_found(value: str | None) -> str:
     return normalized if normalized else NOT_FOUND_VALUE
 
 
+def _dump_debug_html(
+    page,
+    base_dir: Path,
+    settings: Any,
+    item_id: int | str,
+) -> None:
+    if settings is None or not getattr(settings, "debug_dump_html", False):
+        return
+    rel = (getattr(settings, "debug_html_dir", None) or "debug_html").strip()
+    out_dir = base_dir / rel
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = out_dir / f"{item_id}_{stamp}.html"
+    try:
+        path.write_text(page.content(), encoding="utf-8")
+        print(f"Debug HTML → {path}")
+    except Exception as exc:
+        print(f"Debug HTML не сохранён: {exc}")
+
+
 def _maybe_append_google_sheet(
     record: dict,
     base_dir: Path,
@@ -835,22 +863,33 @@ def _maybe_append_google_sheet(
     item_id: int,
     booking_prices: dict[str, str],
     listing_url: str,
+    *,
+    sh: Any = None,
+    settings: Any = None,
+    removed: bool = False,
+    queue_next_index: int | None = None,
 ) -> None:
     if os.environ.get("AVITO_GOOGLE_SHEET", "").lower() not in ("1", "true", "yes", "on"):
         return
-    try:
-        from avito_google_sheet import sync_after_listing
-    except ImportError:
-        print(f"[{idx}/{total}] Google Sheet: нет модуля avito_google_sheet или зависимостей (gspread, google-auth)")
+    if sh is None or settings is None:
         return
     try:
-        sync_after_listing(
+        from google_sheets import sync_after_listing
+    except ImportError:
+        print(f"[{idx}/{total}] Google Sheet: пакет google_sheets недоступен")
+        return
+    try:
+        ok, wrote = sync_after_listing(
+            sh,
+            settings,
             record,
             EXPORT_COLUMNS,
             booking_prices,
             listing_url,
-            base_dir=base_dir,
+            removed=removed,
+            queue_next_index=queue_next_index,
         )
+        print(f"[{idx}/{total}] Google Sheet ({wrote}): {'ок' if ok else 'проблема'}")
     except Exception as exc:
         print(f"[{idx}/{total}] id={item_id} Google Sheet: {exc}")
 
@@ -861,14 +900,32 @@ def _process_one_url(
     url: str,
     idx: int,
     total: int,
+    *,
+    sh: Any = None,
+    settings: Any = None,
+    queue_next_index: int | None = None,
 ) -> dict | None:
     item_id = _extract_id_from_url(url) or idx
     print(f"[{idx}/{total}] Открываю: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    _human_pause(page, 0.4, 1.0)
+    _human_pause(page, 0.2, 0.45)
     _simulate_human_activity(page)
     _wait_for_item_spa_ready(page, idx, total)
-    _human_pause(page, 0.5, 1.2)
+    _human_pause(page, 0.2, 0.45)
+
+    title_early = _extract_title(page) or f"house_{item_id}"
+    if is_listing_removed(title_early):
+        record = {"ссылка": url, "название": NOT_FOUND_VALUE}
+        for col in EXPORT_COLUMNS:
+            if col not in ("ссылка",):
+                record[col] = NOT_FOUND_VALUE
+        _maybe_append_google_sheet(
+            record, base_dir, idx, total, item_id, {}, url,
+            sh=sh, settings=settings, removed=True, queue_next_index=queue_next_index,
+        )
+        print(f"[{idx}/{total}] id={item_id} снято с сайта")
+        return record
+
     print(
         f"[{idx}/{total}] Сценарий на карточке: пауза {INITIAL_WAIT_MIN_S:.0f}-{INITIAL_WAIT_MAX_S:.0f} с, "
         f"лёгкий скролл {LIGHT_SCROLL_PHASE_MIN_S:.0f}-{LIGHT_SCROLL_PHASE_MAX_S:.0f} с, "
@@ -883,18 +940,19 @@ def _process_one_url(
         nd = page.locator('[data-marker="nearest-dates"]')
         if nd.count() > 0:
             nd.first.scroll_into_view_if_needed(timeout=12000)
-            _human_pause(page, 0.2, 0.55)
+            _human_pause(page, 0.15, 0.35)
             booking_map = _collect_booking_prices_with_loaders(page, booking_phase_end)
     except Exception as exc:
         print(f"[{idx}/{total}] id={item_id} Блок ближайших дат: {exc}")
 
     _scroll_for_duration(page, FINAL_SCROLL_MIN_S, FINAL_SCROLL_MAX_S)
-    _simulate_human_activity(page)
-    _human_pause(page, 0.25, 0.6)
+    _human_pause(page, 0.15, 0.35)
     try:
         page.wait_for_load_state("networkidle", timeout=4000)
     except Exception:
         pass
+
+    _dump_debug_html(page, base_dir, settings, item_id)
 
     title = _extract_title(page) or f"house_{item_id}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -976,7 +1034,10 @@ def _process_one_url(
     if _normalize_space(seller_profile):
         record["ссылка создателя"] = _normalize_space(seller_profile)
 
-    _maybe_append_google_sheet(record, base_dir, idx, total, item_id, booking_prices, url)
+    _maybe_append_google_sheet(
+        record, base_dir, idx, total, item_id, booking_prices, url,
+        sh=sh, settings=settings, removed=False, queue_next_index=queue_next_index,
+    )
     print(f"[{idx}/{total}] id={item_id} готово: {_or_not_found(title)}")
     return record
 
@@ -984,25 +1045,33 @@ def _process_one_url(
 def main() -> None:
     _setup_playwright_env()
 
-    base_dir = Path(__file__).resolve().parent
+    base_dir = project_root()
 
-    urls = _load_urls(base_dir)
+    sh, settings, urls, start_offset, full_queue_len = _load_urls(base_dir)
     if not urls:
-        print("Нечего парсить: все ссылки из «ссылки» уже есть в таблице с заполненным названием.")
+        print("Нечего парсить.")
         return
 
-    print(f"К обработке {len(urls)} ссылок.")
+    restart_every = settings.browser_restart_every if settings else BROWSER_RESTART_EVERY
+    print(
+        f"К обработке {len(urls)} ссылок "
+        f"(итерация {settings.parse_iteration if settings else 1}, "
+        f"с #{start_offset + 1} из {full_queue_len})."
+    )
 
+    processed_ok = 0
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context, page = _new_page(browser)
         parsed_in_session = 0
         try:
             total = len(urls)
-            for idx, url in enumerate(urls, start=1):
-                if parsed_in_session >= BROWSER_RESTART_EVERY:
+            for local_idx, url in enumerate(urls, start=1):
+                idx = start_offset + local_idx
+                next_index = idx
+                if parsed_in_session >= restart_every:
                     print(
-                        f"[{idx}/{total}] Перезапуск браузера после {BROWSER_RESTART_EVERY} "
+                        f"[{idx}/{total}] Перезапуск браузера после {restart_every} "
                         "успешно обработанных объявлений..."
                     )
                     try:
@@ -1018,7 +1087,16 @@ def main() -> None:
                     parsed_in_session = 0
 
                 try:
-                    record = _process_one_url(page, base_dir, url, idx, total)
+                    record = _process_one_url(
+                        page,
+                        base_dir,
+                        url,
+                        local_idx,
+                        total,
+                        sh=sh,
+                        settings=settings,
+                        queue_next_index=next_index,
+                    )
                 except Exception as exc:
                     print(f"[{idx}/{total}] Ошибка обработки {url}: {exc}")
                     traceback.print_exc()
@@ -1028,8 +1106,22 @@ def main() -> None:
                     continue
 
                 parsed_in_session += 1
+                processed_ok += 1
 
             print("Обработка завершена.")
+            if sh is not None and settings is not None and full_queue_len > 0:
+                try:
+                    from google_sheets import finish_parse_session
+
+                    final_progress = start_offset + processed_ok
+                    finish_parse_session(
+                        sh,
+                        settings,
+                        full_queue_len=full_queue_len,
+                        final_progress=final_progress,
+                    )
+                except ImportError:
+                    pass
         finally:
             try:
                 context.close()
