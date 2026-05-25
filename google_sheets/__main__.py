@@ -47,7 +47,7 @@ def main() -> int:
 
         sh = open_spreadsheet(ROOT)
         settings = load_settings(ROOT, sh)
-        sh = open_spreadsheet(ROOT, sheet_id=settings.spreadsheet_id)
+        sh = open_spreadsheet(ROOT)
         settings = load_settings(ROOT, sh)
         urls = load_url_list(ROOT, settings, sh)
         rebuild_logs_sheet(ROOT, settings, sh, urls)

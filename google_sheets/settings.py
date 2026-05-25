@@ -25,7 +25,6 @@ class ParserSettings:
     detail_range_from: int = 0
     detail_range_to: int = 0
     browser_restart_every: int = 10
-    spreadsheet_id: str = DEFAULT_SPREADSHEET_ID
     # --- детальный парсер ---
     run_detail: bool = False
     detail_fill_mode: str = "append"
@@ -59,79 +58,149 @@ class ParserSettings:
         return {f.name for f in fields(cls)}
 
 
-DEFAULTS_WITH_HINTS: list[tuple[str, str, str]] = [
+SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
     (
         "sync_from_links_sheet",
         "1",
-        "1 — очередь с листа «ссылки», дописать URL на рабочие листы. "
-        "0 — только столбец A листа сдаваемости (без синхронизации с «ссылки»)",
+        "Откуда брать список URL для парсинга. 1 — из листа «ссылки» (столбец A); при запуске "
+        "новые URL дописываются в конец листов «сдаваемость», «цены», «логи» (и «деталь», если включена). "
+        "0 — очередь только из уже существующих строк листа «сдаваемость»; лист «ссылки» не читается. "
+        "Удалённые из «ссылок» строки сами из других листов НЕ пропадают (см. calendar_mode / detail_fill_mode).",
     ),
     (
         "detail_range_from",
         "0",
-        "Индекс первой ссылки (с 0). В паре с detail_range_to=0 означает «все ссылки»",
+        "С какой ссылки по счёту начать (первая = 0). Работает всегда, независимо от других режимов.",
     ),
     (
         "detail_range_to",
         "0",
-        "Индекс конца (НЕ включая): 0+1 → одна ссылка; 0+10 → десять. "
-        "Оба 0 → весь список",
+        "До какой ссылки (индекс НЕ входит). Примеры: 0 и 10 → первые 10 ссылок; 0 и 1 → одна ссылка; "
+        "оба 0 → весь список из «ссылок» (или из «сдаваемости», если sync_from_links_sheet=0).",
     ),
-    ("browser_restart_every", "10", "Перезапуск браузера после N объявлений"),
-    ("spreadsheet_id", DEFAULT_SPREADSHEET_ID, "ID таблицы (переопределяется через .env)"),
-    ("run_detail", "0", "1 — парсить лист «детальная информация»; 0 — пропустить"),
+    (
+        "browser_restart_every",
+        "10",
+        "После скольких успешно обработанных объявлений перезапустить браузер (снижает сбои и утечки памяти).",
+    ),
+    (
+        "run_detail",
+        "0",
+        "1 — дополнительно парсить лист «детальная информация» (телефон, описание, фото, характеристики). "
+        "0 — только бронь и цены (если run_calendar=1). Обычно для ежедневного прогона: 0.",
+    ),
     (
         "detail_fill_mode",
         "append",
-        "primary — пересоздать лист и парсить все; append — только пустое «название»; "
-        "rebuild — очистить и заново; range — устарело, диапазон задаётся индексами выше",
+        "Только если run_detail=1. primary — полностью пересоздать лист «детальная информация» "
+        "по текущему списку «ссылки» (все старые строки и данные удаляются), затем парсить. "
+        "rebuild — очистить лист и заново заполнить только столбец URL из «ссылки», без парсинга карточек. "
+        "append — не удалять лист; парсить только строки, где в колонке «название» пусто (см. detail_only_empty_title).",
     ),
     (
         "detail_only_empty_title",
         "1",
-        "При append: 1 — не трогать строки с заполненным «название»; 0 — парсить все в диапазоне",
+        "Только при detail_fill_mode=append. 1 — пропускать строки, у которых «название» уже заполнено "
+        "(удобно догонять новые ссылки). 0 — при append обрабатывать все URL из диапазона, даже с заполненным названием.",
     ),
-    ("run_calendar", "1", "1 — парсить «сдаваемость по дням» и «цены по дням»"),
+    (
+        "run_calendar",
+        "1",
+        "1 — парсить «сдаваемость по дням» и «цены по дням» с Avito (основной режим). "
+        "0 — календарь не трогать (имеет смысл только при отладке).",
+    ),
     (
         "calendar_mode",
         "daily",
-        "primary — пересоздать календарные листы (нужен sync_from_links_sheet=1); "
-        "daily — дополнение дат ≥ сегодня",
+        "Только если run_calendar=1. daily — оставить существующие строки и даты; дописать новые URL "
+        "в конец; обновлять ячейки по мере парсинга. primary — один раз пересоздать листы «сдаваемость» "
+        "и «цены» только по текущему списку «ссылки» (старые URL и все 0/1/цены удаляются; нужен повторный прогон парсера). "
+        "Нужен sync_from_links_sheet=1.",
     ),
-    ("calendar_start_date", "03.05", "Первая дата столбца при calendar_mode=primary (ДД.ММ)"),
-    ("calendar_start_year", "2026", "Год для заголовков дат"),
+    (
+        "calendar_start_date",
+        "03.05",
+        "Только при calendar_mode=primary: с какой даты начать столбцы календаря (формат ДД.ММ).",
+    ),
+    (
+        "calendar_start_year",
+        "2026",
+        "Год для подписей дат в заголовках (ДД.ММ).",
+    ),
     (
         "calendar_horizon_days",
         "90",
-        "Запас столбцов вперёд при calendar_mode=primary; плюс даты из брони",
+        "Только при calendar_mode=primary: сколько дней вперёд заложить в шапку при пересоздании листа.",
     ),
     (
         "debug_dump_html",
         "0",
-        "1 — сохранять HTML страницы после прокруток и брони в debug_html_dir",
+        "1 — сохранять HTML каждой карточки в папку debug_html_dir (для отладки). 0 — не сохранять.",
     ),
-    ("debug_html_dir", "debug_html", "Папка для HTML-дампов (от корня проекта)"),
+    ("debug_html_dir", "debug_html", "Папка для HTML-файлов (от корня проекта avito_bron)."),
     (
         "parse_iteration",
         "1",
-        "Номер текущей итерации (прогон). После полного прохода +1 автоматически",
+        "Номер текущего «прогона» по всему списку. После полного прохода всех ссылок увеличивается на 1. "
+        "Можно вручную сбросить в 1 при новом цикле мониторинга.",
     ),
     (
         "iteration_progress",
         "0",
-        "Сколько ссылок уже обработано в этой итерации (0 = с начала). При обрыве — продолжение",
+        "Служебное. Старт с какой ссылки продолжать — обычно само по листу «логи»; вручную 0 = с начала списка.",
     ),
-    ("iteration_status", "idle", "running | complete | idle"),
-    ("iteration_slot_0", "1", "Какая итерация в 1-м блоке логов (столбцы B–E)"),
-    ("iteration_slot_1", "2", "2-й блок логов (F–I)"),
-    ("iteration_slot_2", "3", "3-й блок логов (J–M)"),
-    ("sheet_links", DEFAULT_WORKSHEET_LINKS, "Лист со списком URL"),
-    ("sheet_detail", DEFAULT_WORKSHEET_DETAIL, "Детальная информация"),
-    ("sheet_availability", DEFAULT_WORKSHEET_AVAILABILITY, "Сдаваемость по дням"),
-    ("sheet_prices", DEFAULT_WORKSHEET_PRICES_DAYS, "Цены по дням"),
-    ("sheet_logs", DEFAULT_WORKSHEET_LOGS, "Логи ежедневного парсинга"),
-    ("sheet_settings", DEFAULT_WORKSHEET_SETTINGS, "Этот лист"),
+    (
+        "iteration_status",
+        "idle",
+        "Служебное состояние последнего запуска: idle — не запускали / готов; running — парсер работает; "
+        "complete — последняя итерация дошла до конца списка. Можно не трогать.",
+    ),
+    (
+        "iteration_slot_0",
+        "1",
+        "Служебное: номер итерации в 1-м блоке логов (колонки C–F: ит.N, дата, время, статус). Обновляется парсером.",
+    ),
+    (
+        "iteration_slot_1",
+        "2",
+        "Служебное: номер итерации во 2-м блоке (H–K).",
+    ),
+    (
+        "iteration_slot_2",
+        "3",
+        "Служебное: номер итерации в 3-м блоке (M–P). Кольцо из трёх последних прогонов.",
+    ),
 ]
+
+SETTINGS_SHEET_NAMES: list[tuple[str, str, str]] = [
+    ("sheet_links", DEFAULT_WORKSHEET_LINKS, "Имя листа со списком URL (столбец A)."),
+    ("sheet_detail", DEFAULT_WORKSHEET_DETAIL, "Имя листа детальной информации."),
+    ("sheet_availability", DEFAULT_WORKSHEET_AVAILABILITY, "Имя листа сдаваемости по дням (0/1)."),
+    ("sheet_prices", DEFAULT_WORKSHEET_PRICES_DAYS, "Имя листа цен по дням."),
+    ("sheet_logs", DEFAULT_WORKSHEET_LOGS, "Имя листа логов парсинга."),
+    ("sheet_settings", DEFAULT_WORKSHEET_SETTINGS, "Имя этого листа настроек."),
+]
+
+SETTINGS_SHEET_GAP_ROWS = 5
+
+
+def _build_settings_body() -> list[list[str]]:
+    header = ["ключ", "значение", "описание"]
+    body: list[list[str]] = [header]
+    for key, val, hint in SETTINGS_DYNAMIC:
+        body.append([key, val, hint])
+    body.append(
+        [
+            "",
+            "",
+            "——— Ниже только имена листов в Google Таблице (не настройки парсера) ———",
+        ]
+    )
+    for _ in range(SETTINGS_SHEET_GAP_ROWS):
+        body.append(["", "", ""])
+    for key, val, hint in SETTINGS_SHEET_NAMES:
+        body.append([key, val, hint])
+    return body
 
 
 def _parse_bool(raw: str) -> bool:
@@ -184,7 +253,11 @@ def seed_settings_sheet(ws: Any, *, force: bool = False) -> None:
     rows = ws.get_all_values()
     if not force and _sheet_has_settings_rows(rows):
         existing = {(row[0] or "").strip() for row in rows[1:] if row}
-        missing = [(k, v, h) for k, v, h in DEFAULTS_WITH_HINTS if k not in existing]
+        missing = [
+            (k, v, h)
+            for k, v, h in SETTINGS_DYNAMIC + SETTINGS_SHEET_NAMES
+            if k and k not in existing
+        ]
         if not missing:
             return
         header = rows[0] if rows and rows[0] else ["ключ", "значение", "описание"]
@@ -209,10 +282,7 @@ def seed_settings_sheet(ws: Any, *, force: bool = False) -> None:
         print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}»: добавлено ключей — {len(missing)}.")
         return
 
-    header = ["ключ", "значение", "описание"]
-    body = [header]
-    for key, val, hint in DEFAULTS_WITH_HINTS:
-        body.append([key, val, hint])
+    body = _build_settings_body()
 
     def _write() -> None:
         ws.clear()

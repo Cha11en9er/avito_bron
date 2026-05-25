@@ -112,7 +112,7 @@ def prepare_parse_session(
 ) -> tuple[Any, ParserSettings, list[str], int, int]:
     sh = open_spreadsheet(base_dir)
     settings = load_settings(base_dir, sh)
-    sh = open_spreadsheet(base_dir, sheet_id=settings.spreadsheet_id)
+    sh = open_spreadsheet(base_dir)
     settings = load_settings(base_dir, sh)
 
     sh, full_queue = build_parse_queue(base_dir, settings, export_columns)

@@ -28,18 +28,18 @@ except ImportError:
         return "не посмотреть" in (title or "").lower()
 
 NAV_TIMEOUT_MS = 90000
-# Сумма фаз на карточке (сек.): пауза 1–2.5 + скролл 1.5–2 + бронь до 9 + финал 1–2 ≈ 18–20.
-INITIAL_WAIT_MIN_S = 1.0
-INITIAL_WAIT_MAX_S = 2.5
-LIGHT_SCROLL_PHASE_MIN_S = 1.5
-LIGHT_SCROLL_PHASE_MAX_S = 2.0
+# Сумма фаз на карточке (сек.): пауза 3–8 + скролл 2–3 + блок брони 8–10 + финал 3–5 ≲ 26 + мелкие паузы.
+INITIAL_WAIT_MIN_S = 3.0
+INITIAL_WAIT_MAX_S = 8.0
+LIGHT_SCROLL_PHASE_MIN_S = 2.0
+LIGHT_SCROLL_PHASE_MAX_S = 3.0
 BOOKING_PHASE_MIN_S = 8.0
-BOOKING_PHASE_MAX_S = 9.0
-FINAL_SCROLL_MIN_S = 1.0
-FINAL_SCROLL_MAX_S = 2.0
+BOOKING_PHASE_MAX_S = 10.0
+FINAL_SCROLL_MIN_S = 3.0
+FINAL_SCROLL_MAX_S = 5.0
 BOOKING_LOADER_CLICKS = 4
-BOOKING_CLICK_PAUSE_MS_MIN = 400
-BOOKING_CLICK_PAUSE_MS_MAX = 750
+BOOKING_CLICK_PAUSE_MS_MIN = 450
+BOOKING_CLICK_PAUSE_MS_MAX = 1100
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
 BROWSER_RESTART_EVERY = 10
 URLS_FILE_NAME = "urls.txt"
@@ -172,11 +172,11 @@ def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> No
 def _simulate_human_activity(page) -> None:
     # Лёгкие случайные движения мышью — убираем "идеально ровный" машинный паттерн.
     try:
-        for _ in range(random.randint(2, 3)):
+        for _ in range(random.randint(2, 4)):
             x = random.randint(100, 1200)
             y = random.randint(120, 760)
             page.mouse.move(x, y, steps=random.randint(8, 20))
-            _human_pause(page, 0.08, 0.22)
+            _human_pause(page, 0.1, 0.35)
     except Exception:
         pass
 
@@ -366,6 +366,11 @@ def _collect_booking_prices_with_loaders(page, phase_deadline: float) -> dict[st
             pause_ms = min(pause_ms, max(120, remaining_ms - 80))
         page.wait_for_timeout(pause_ms)
         acc = _merge_booking_dicts(acc, _read_booking_slots(page))
+    while time.monotonic() < phase_deadline:
+        _micro_scroll_nudge(page)
+        if time.monotonic() >= phase_deadline:
+            break
+        page.wait_for_timeout(80)
     return acc
 
 
@@ -908,10 +913,10 @@ def _process_one_url(
     item_id = _extract_id_from_url(url) or idx
     print(f"[{idx}/{total}] Открываю: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    _human_pause(page, 0.2, 0.45)
+    _human_pause(page, 0.4, 1.0)
     _simulate_human_activity(page)
     _wait_for_item_spa_ready(page, idx, total)
-    _human_pause(page, 0.2, 0.45)
+    _human_pause(page, 0.5, 1.2)
 
     title_early = _extract_title(page) or f"house_{item_id}"
     if is_listing_removed(title_early):
@@ -940,13 +945,14 @@ def _process_one_url(
         nd = page.locator('[data-marker="nearest-dates"]')
         if nd.count() > 0:
             nd.first.scroll_into_view_if_needed(timeout=12000)
-            _human_pause(page, 0.15, 0.35)
+            _human_pause(page, 0.2, 0.55)
             booking_map = _collect_booking_prices_with_loaders(page, booking_phase_end)
     except Exception as exc:
         print(f"[{idx}/{total}] id={item_id} Блок ближайших дат: {exc}")
 
     _scroll_for_duration(page, FINAL_SCROLL_MIN_S, FINAL_SCROLL_MAX_S)
-    _human_pause(page, 0.15, 0.35)
+    _simulate_human_activity(page)
+    _human_pause(page, 0.25, 0.6)
     try:
         page.wait_for_load_state("networkidle", timeout=4000)
     except Exception:

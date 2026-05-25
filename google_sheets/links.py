@@ -44,7 +44,7 @@ def _read_urls_col_a(ws: Any, sheet_title: str) -> list[str]:
 
 
 def load_urls_from_links_sheet(base_dir: Path, settings: ParserSettings, sh: Any | None = None) -> list[str]:
-    workbook = sh or open_spreadsheet(base_dir, sheet_id=settings.spreadsheet_id)
+    workbook = sh or open_spreadsheet(base_dir)
     ws = get_worksheet(workbook, settings.sheet_links)
     if ws is None:
         raise RuntimeError(
@@ -155,7 +155,7 @@ def build_parse_queue(
     settings: ParserSettings,
     export_columns: list[str],
 ) -> tuple[Any, list[str]]:
-    sh = open_spreadsheet(base_dir, sheet_id=settings.spreadsheet_id)
+    sh = open_spreadsheet(base_dir)
     all_urls = load_url_list(base_dir, settings, sh)
     if not all_urls:
         print("Список URL пуст после применения диапазона.")
