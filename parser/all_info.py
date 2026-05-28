@@ -28,15 +28,15 @@ except ImportError:
         return "не посмотреть" in (title or "").lower()
 
 NAV_TIMEOUT_MS = 90000
-# Сумма фаз на карточке (сек.): пауза 3–8 + скролл 2–3 + блок брони 8–10 + финал 3–5 ≲ 26 + мелкие паузы.
-INITIAL_WAIT_MIN_S = 3.0
-INITIAL_WAIT_MAX_S = 8.0
-LIGHT_SCROLL_PHASE_MIN_S = 2.0
-LIGHT_SCROLL_PHASE_MAX_S = 3.0
-BOOKING_PHASE_MIN_S = 8.0
-BOOKING_PHASE_MAX_S = 10.0
-FINAL_SCROLL_MIN_S = 3.0
-FINAL_SCROLL_MAX_S = 5.0
+# Сумма фаз на карточке (сек.): пауза 0.8–1.5 + скролл 1–1.5 + бронь 7–8 + финал 0.8–1.2 ≈ 10–12 + OCR/таблица.
+INITIAL_WAIT_MIN_S = 0.8
+INITIAL_WAIT_MAX_S = 1.5
+LIGHT_SCROLL_PHASE_MIN_S = 1.0
+LIGHT_SCROLL_PHASE_MAX_S = 1.5
+BOOKING_PHASE_MIN_S = 7.0
+BOOKING_PHASE_MAX_S = 8.0
+FINAL_SCROLL_MIN_S = 0.8
+FINAL_SCROLL_MAX_S = 1.2
 BOOKING_LOADER_CLICKS = 4
 BOOKING_CLICK_PAUSE_MS_MIN = 450
 BOOKING_CLICK_PAUSE_MS_MAX = 1100
@@ -172,13 +172,37 @@ def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> No
 def _simulate_human_activity(page) -> None:
     # Лёгкие случайные движения мышью — убираем "идеально ровный" машинный паттерн.
     try:
-        for _ in range(random.randint(2, 4)):
+        for _ in range(random.randint(1, 2)):
             x = random.randint(100, 1200)
             y = random.randint(120, 760)
-            page.mouse.move(x, y, steps=random.randint(8, 20))
-            _human_pause(page, 0.1, 0.35)
+            page.mouse.move(x, y, steps=random.randint(6, 14))
+            _human_pause(page, 0.05, 0.2)
     except Exception:
         pass
+
+
+def _page_looks_removed(page) -> bool:
+    """Быстрая проверка снятого объявления — не ждём 65 с пустого SPA."""
+    try:
+        title_loc = page.locator(
+            'h1[itemprop="name"], [data-marker="item-view/title-info"] h1'
+        ).first
+        if title_loc.count() > 0:
+            t = title_loc.inner_text(timeout=800) or ""
+            if is_listing_removed(t):
+                return True
+    except Exception:
+        pass
+    try:
+        low = (page.locator("body").inner_text(timeout=1500) or "").lower()
+        if any(
+            x in low
+            for x in ("не посмотреть", "снято с продажи", "объявление закрыто", "объявление недоступно")
+        ):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _wait_for_item_spa_ready(page, idx: int, total: int) -> None:
@@ -188,10 +212,18 @@ def _wait_for_item_spa_ready(page, idx: int, total: int) -> None:
         'h1[itemprop="name"], '
         '[data-marker="item-view/title-info"] h1'
     )
-    try:
-        page.locator(selectors).first.wait_for(state="visible", timeout=65000)
-    except Exception as exc:
-        print(f"[{idx}/{total}] Предупреждение: долго не появлялась карточка объявления: {exc}")
+    loc = page.locator(selectors).first
+    deadline = time.monotonic() + 65.0
+    while time.monotonic() < deadline:
+        if _page_looks_removed(page):
+            return
+        try:
+            if loc.is_visible(timeout=1200):
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(350)
+    print(f"[{idx}/{total}] Предупреждение: долго не появлялась карточка объявления")
 
 
 def _scroll_through_page(page, total_scrolls: int = 6) -> None:
@@ -331,16 +363,57 @@ def _merge_booking_dicts(
 
 
 def _click_nearest_dates_loader(page) -> bool:
-    loc = page.locator(
+    """
+    Листаем карусель «ближайшие даты».
+    Сначала плейсхолдер (как в рабочей версии), затем кнопка вперёд без is_enabled
+    (у Авито часто tabindex=-1 при рабочей кнопке).
+    """
+    loader = page.locator(
         '[data-marker="nearest-dates"] div._4fc2ff53aabfae78.edd2186806a9484c._0ad1ed89cd18697d'
     ).first
-    if loc.count() == 0:
-        return False
+    if loader.count() > 0:
+        try:
+            if loader.is_visible(timeout=1500):
+                loader.click(timeout=10000)
+                return True
+        except Exception:
+            pass
+
+    fwd = page.locator('[data-marker="nearest-dates/scroll-button-forward"]').first
+    if fwd.count() > 0:
+        try:
+            if fwd.is_visible(timeout=1500):
+                fwd.click(timeout=10000, force=True)
+                return True
+        except Exception:
+            pass
+
     try:
-        if not loc.is_visible(timeout=1500):
-            return False
-        loc.click(timeout=10000)
-        return True
+        return bool(
+            page.evaluate(
+                """() => {
+                const root = document.querySelector('[data-marker="nearest-dates"]');
+                if (!root) return false;
+                const ph = root.querySelector(
+                    'div._4fc2ff53aabfae78.edd2186806a9484c._0ad1ed89cd18697d'
+                );
+                if (ph) { ph.click(); return true; }
+                const btn = root.querySelector(
+                    '[data-marker="nearest-dates/scroll-button-forward"]'
+                );
+                if (btn) { btn.click(); return true; }
+                const ul = root.querySelector('ul');
+                if (ul && ul.scrollWidth > ul.clientWidth + 2) {
+                    ul.scrollLeft = Math.min(
+                        ul.scrollLeft + Math.max(ul.clientWidth, 120),
+                        ul.scrollWidth
+                    );
+                    return true;
+                }
+                return false;
+            }"""
+            )
+        )
     except Exception:
         return False
 
@@ -911,12 +984,13 @@ def _process_one_url(
     queue_next_index: int | None = None,
 ) -> dict | None:
     item_id = _extract_id_from_url(url) or idx
+    t_link_start = time.monotonic()
     print(f"[{idx}/{total}] Открываю: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    _human_pause(page, 0.4, 1.0)
+    _human_pause(page, 0.3, 0.7)
     _simulate_human_activity(page)
     _wait_for_item_spa_ready(page, idx, total)
-    _human_pause(page, 0.5, 1.2)
+    _human_pause(page, 0.35, 0.9)
 
     title_early = _extract_title(page) or f"house_{item_id}"
     if is_listing_removed(title_early):
@@ -932,9 +1006,9 @@ def _process_one_url(
         return record
 
     print(
-        f"[{idx}/{total}] Сценарий на карточке: пауза {INITIAL_WAIT_MIN_S:.0f}-{INITIAL_WAIT_MAX_S:.0f} с, "
-        f"лёгкий скролл {LIGHT_SCROLL_PHASE_MIN_S:.0f}-{LIGHT_SCROLL_PHASE_MAX_S:.0f} с, "
-        f"бронь до {BOOKING_PHASE_MAX_S:.0f} с, финальный скролл {FINAL_SCROLL_MIN_S:.0f}-{FINAL_SCROLL_MAX_S:.0f} с."
+        f"[{idx}/{total}] Сценарий на карточке: пауза {INITIAL_WAIT_MIN_S:.1f}-{INITIAL_WAIT_MAX_S:.1f} с, "
+        f"лёгкий скролл {LIGHT_SCROLL_PHASE_MIN_S:.1f}-{LIGHT_SCROLL_PHASE_MAX_S:.1f} с, "
+        f"бронь до {BOOKING_PHASE_MAX_S:.1f} с, финальный скролл {FINAL_SCROLL_MIN_S:.1f}-{FINAL_SCROLL_MAX_S:.1f} с."
     )
     page.wait_for_timeout(int(random.uniform(INITIAL_WAIT_MIN_S, INITIAL_WAIT_MAX_S) * 1000))
     _scroll_for_duration(page, LIGHT_SCROLL_PHASE_MIN_S, LIGHT_SCROLL_PHASE_MAX_S)
@@ -951,12 +1025,12 @@ def _process_one_url(
         print(f"[{idx}/{total}] id={item_id} Блок ближайших дат: {exc}")
 
     _scroll_for_duration(page, FINAL_SCROLL_MIN_S, FINAL_SCROLL_MAX_S)
-    _simulate_human_activity(page)
-    _human_pause(page, 0.25, 0.6)
-    try:
-        page.wait_for_load_state("networkidle", timeout=4000)
-    except Exception:
-        pass
+    _human_pause(page, 0.2, 0.5)
+    t_card_done = time.monotonic()
+    print(
+        f"[{idx}/{total}] id={item_id} фазы карточки (пауза+скролл+бронь): "
+        f"{t_card_done - t_link_start:.1f} с, слотов брони: {len(booking_map)}"
+    )
 
     _dump_debug_html(page, base_dir, settings, item_id)
 
@@ -1044,7 +1118,10 @@ def _process_one_url(
         record, base_dir, idx, total, item_id, booking_prices, url,
         sh=sh, settings=settings, removed=False, queue_next_index=queue_next_index,
     )
-    print(f"[{idx}/{total}] id={item_id} готово: {_or_not_found(title)}")
+    print(
+        f"[{idx}/{total}] id={item_id} готово: {_or_not_found(title)} "
+        f"(всего {time.monotonic() - t_link_start:.1f} с на ссылку)"
+    )
     return record
 
 

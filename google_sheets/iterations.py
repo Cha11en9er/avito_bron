@@ -248,7 +248,10 @@ def slice_queue_for_resume(
         save_settings_values(
             sh,
             settings,
-            {"iteration_progress": str(start)},
+            {
+                "iteration_progress": str(start),
+                "iteration_progress_for": str(max(1, settings.parse_iteration)),
+            },
         )
         if stored > 0 and start < stored:
             print(
@@ -272,10 +275,14 @@ def slice_queue_for_resume(
 
 
 def save_iteration_progress(sh: Any, settings: ParserSettings, next_index: int) -> None:
+    it = max(1, settings.parse_iteration)
     save_settings_values(
         sh,
         settings,
-        {"iteration_progress": str(next_index)},
+        {
+            "iteration_progress": str(next_index),
+            "iteration_progress_for": str(it),
+        },
     )
 
 
@@ -309,6 +316,7 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
         {
             "parse_iteration": str(new_it),
             "iteration_progress": "0",
+            "iteration_progress_for": str(new_it),
             "iteration_status": "complete",
             "iteration_slot_0": str(settings.iteration_slot_0),
             "iteration_slot_1": str(settings.iteration_slot_1),
@@ -319,4 +327,9 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
         f"Итерация {old_it} завершена ({total_links} ссылок). "
         f"Следующий запуск — итерация {new_it}, слоты {slot_iteration_ids(settings)}."
     )
-    return replace(settings, parse_iteration=new_it, iteration_progress=0)
+    return replace(
+        settings,
+        parse_iteration=new_it,
+        iteration_progress=0,
+        iteration_progress_for=new_it,
+    )
