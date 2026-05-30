@@ -8,9 +8,11 @@ from typing import Any
 from google_sheets.client import (
     api_retry,
     canon_url,
+    delete_worksheet_rows,
     ensure_worksheet,
     get_worksheet,
     open_spreadsheet,
+    orphan_url_row_indices,
 )
 from google_sheets.detail import (
     detail_title_by_url,
@@ -88,6 +90,45 @@ def load_url_list(base_dir: Path, settings: ParserSettings, sh: Any) -> list[str
     return apply_link_range(urls, settings)
 
 
+def remove_orphan_urls_from_worksheet(ws: Any, allowed_canon: set[str]) -> int:
+    """Удалить строки с URL, которых нет в списке «ссылки» (реальное смещение строк)."""
+    rows = orphan_url_row_indices(ws, allowed_canon)
+    return delete_worksheet_rows(ws, rows)
+
+
+def remove_orphan_urls_from_work_sheets(
+    sh: Any,
+    settings: ParserSettings,
+    urls: list[str],
+) -> int:
+    """Со всех рабочих листов убрать URL, отсутствующие на листе «ссылки»."""
+    allowed = {canon_url(u) for u in urls if canon_url(u)}
+    if not allowed:
+        return 0
+
+    targets = (
+        settings.sheet_availability,
+        settings.sheet_prices,
+        settings.sheet_logs,
+        settings.sheet_detail,
+    )
+
+    total = 0
+    seen_titles: set[str] = set()
+    for title in targets:
+        if title in seen_titles:
+            continue
+        seen_titles.add(title)
+        ws = get_worksheet(sh, title)
+        if ws is None:
+            continue
+        n = remove_orphan_urls_from_worksheet(ws, allowed)
+        if n:
+            print(f"  «{title}»: удалено {n} строк (нет в «{settings.sheet_links}»)")
+            total += n
+    return total
+
+
 def ensure_urls_on_worksheet(ws: Any, urls: list[str]) -> int:
     col_a = ws.col_values(1)
     existing = {canon_url(c) for c in col_a[1:] if c}
@@ -119,17 +160,31 @@ def ensure_urls_on_work_sheets(
     *,
     include_detail: bool = True,
     include_calendar: bool = True,
+    include_logs: bool = False,
+    links_master: list[str] | None = None,
 ) -> None:
-    if not urls:
+    if not urls and not links_master:
         return
+    if settings.sync_from_links_sheet:
+        master = links_master if links_master is not None else urls
+        removed = remove_orphan_urls_from_work_sheets(sh, settings, master)
+        if removed:
+            print(
+                f"Синхронизация с «{settings.sheet_links}»: всего удалено {removed} строк "
+                f"на рабочих листах."
+            )
+
+    urls_to_sync = links_master if (settings.sync_from_links_sheet and links_master) else urls
     targets: list[str] = []
     if include_detail:
         targets.append(settings.sheet_detail)
     if include_calendar:
         targets.extend([settings.sheet_availability, settings.sheet_prices])
+    if include_logs:
+        targets.append(settings.sheet_logs)
     for title in targets:
         ws = ensure_worksheet(sh, title, rows=3000, cols=120)
-        added = ensure_urls_on_worksheet(ws, urls)
+        added = ensure_urls_on_worksheet(ws, urls_to_sync)
         if added:
             print(f"  «{title}»: +{added} строк с URL")
 
@@ -156,24 +211,45 @@ def build_parse_queue(
     export_columns: list[str],
 ) -> tuple[Any, list[str]]:
     sh = open_spreadsheet(base_dir)
-    all_urls = load_url_list(base_dir, settings, sh)
+    links_master: list[str] | None = None
+    if settings.sync_from_links_sheet:
+        links_master = load_urls_from_links_sheet(base_dir, settings, sh=sh)
+        all_urls = apply_link_range(links_master, settings)
+    else:
+        all_urls = load_url_list(base_dir, settings, sh)
     if not all_urls:
         print("Список URL пуст после применения диапазона.")
         return sh, []
 
     prepare_workbook(base_dir, settings, export_columns, sh, all_urls)
 
+    sync_kw = {"links_master": links_master} if links_master is not None else {}
+
     if settings.run_calendar and not settings.run_detail:
         if settings.sync_from_links_sheet:
             ensure_urls_on_work_sheets(
-                sh, settings, all_urls, include_detail=False, include_calendar=True,
+                sh,
+                settings,
+                all_urls,
+                include_detail=False,
+                include_calendar=True,
+                include_logs=True,
+                **sync_kw,
             )
         print(f"Календарь: к парсингу {len(all_urls)}.")
         return sh, all_urls
 
     if settings.run_detail and settings.run_calendar:
         if settings.sync_from_links_sheet:
-            ensure_urls_on_work_sheets(sh, settings, all_urls, include_detail=True, include_calendar=True)
+            ensure_urls_on_work_sheets(
+                sh,
+                settings,
+                all_urls,
+                include_detail=True,
+                include_calendar=True,
+                include_logs=True,
+                **sync_kw,
+            )
         queue = _filter_detail_queue(sh, settings, all_urls)
         print(f"Деталь + календарь: к парсингу {len(queue)}.")
         return sh, queue
@@ -181,7 +257,13 @@ def build_parse_queue(
     if settings.run_detail:
         if settings.sync_from_links_sheet:
             ensure_urls_on_work_sheets(
-                sh, settings, all_urls, include_detail=True, include_calendar=False,
+                sh,
+                settings,
+                all_urls,
+                include_detail=True,
+                include_calendar=False,
+                include_logs=settings.run_calendar,
+                **sync_kw,
             )
         queue = _filter_detail_queue(sh, settings, all_urls)
         print(f"Деталь: к парсингу {len(queue)}.")

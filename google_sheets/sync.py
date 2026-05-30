@@ -121,7 +121,10 @@ def prepare_parse_session(
     if settings.run_calendar and full_queue:
         ensure_logs_sheet(sh, settings, full_queue)
 
-    settings = begin_iteration(sh, settings)
+    settings = begin_iteration(sh, settings, urls=full_queue if full_queue else None)
+    if settings.run_calendar and full_queue:
+        ensure_logs_sheet(sh, settings, full_queue)
+
     queue, start_offset = slice_queue_for_resume(sh, full_queue, settings)
 
     return sh, settings, queue, start_offset, len(full_queue)

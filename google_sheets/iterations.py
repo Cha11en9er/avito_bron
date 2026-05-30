@@ -156,6 +156,63 @@ def _slot_columns(settings: ParserSettings, iteration_number: int) -> tuple[int,
     return base + 1, base + 2, base + 3
 
 
+def _should_clear_logs_slot(settings: ParserSettings, iteration_number: int) -> bool:
+    """Новая итерация или явный перезапуск с progress=0 — очистить блок логов слота."""
+    it = max(1, iteration_number)
+    if settings.iteration_logs_cleared_for != it:
+        return True
+    if settings.iteration_progress == 0 and (settings.iteration_status or "").strip() != "running":
+        return True
+    return False
+
+
+def clear_iteration_slot_logs(
+    sh: Any,
+    settings: ParserSettings,
+    iteration_number: int,
+) -> None:
+    """Очистить блок ит./дата/время/статус для слота данной итерации (все строки URL)."""
+    from gspread.utils import rowcol_to_a1
+
+    ws = get_worksheet(sh, settings.sheet_logs)
+    if ws is None:
+        return
+
+    it = max(1, iteration_number)
+    slot = iteration_slot_index(it)
+    base = slot_base_column(slot)
+    cols = (base, base + 1, base + 2, base + 3)
+
+    rows = ws.get_all_values()
+    if len(rows) < 2:
+        return
+
+    n_rows = len(rows)
+    body: list[dict] = [
+        {
+            "range": rowcol_to_a1(1, base),
+            "values": [[f"ит.{it}"]],
+        },
+    ]
+    for col in cols:
+        body.append(
+            {
+                "range": f"{rowcol_to_a1(2, col)}:{rowcol_to_a1(n_rows, col)}",
+                "values": [[""] for _ in range(n_rows - 1)],
+            }
+        )
+
+    def _write() -> None:
+        ws.batch_update(body, value_input_option="USER_ENTERED")
+
+    api_retry(_write)
+    slot_cols = "CDEF" if slot == 0 else ("HIJK" if slot == 1 else "MNOP")
+    print(
+        f"Лист «{settings.sheet_logs}»: очищен блок итерации {it} "
+        f"(слот {slot + 1}, столбцы {slot_cols})."
+    )
+
+
 def write_log_entry(
     sh: Any,
     settings: ParserSettings,
@@ -286,9 +343,23 @@ def save_iteration_progress(sh: Any, settings: ParserSettings, next_index: int) 
     )
 
 
-def begin_iteration(sh: Any, settings: ParserSettings) -> ParserSettings:
+def begin_iteration(
+    sh: Any,
+    settings: ParserSettings,
+    *,
+    urls: list[str] | None = None,
+) -> ParserSettings:
+    from dataclasses import replace
+
     it = max(1, settings.parse_iteration)
     settings = assign_iteration_to_slot(settings, it)
+
+    if settings.run_calendar and _should_clear_logs_slot(settings, it):
+        if urls:
+            ensure_logs_sheet(sh, settings, urls)
+        clear_iteration_slot_logs(sh, settings, it)
+        settings = replace(settings, iteration_logs_cleared_for=it)
+
     save_settings_values(
         sh,
         settings,
@@ -298,6 +369,7 @@ def begin_iteration(sh: Any, settings: ParserSettings) -> ParserSettings:
             "iteration_slot_1": str(settings.iteration_slot_1),
             "iteration_slot_2": str(settings.iteration_slot_2),
             "iteration_status": "running",
+            "iteration_logs_cleared_for": str(settings.iteration_logs_cleared_for),
         },
     )
     return settings
@@ -325,7 +397,9 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
     )
     print(
         f"Итерация {old_it} завершена ({total_links} ссылок). "
-        f"Следующий запуск — итерация {new_it}, слоты {slot_iteration_ids(settings)}."
+        f"В настройках: parse_iteration={new_it}, iteration_progress=0. "
+        f"Парсер остановлен — новый прогон только после ручного запуска "
+        f"(итерация {new_it}, логи в слоте {slot_iteration_ids(settings)})."
     )
     return replace(
         settings,

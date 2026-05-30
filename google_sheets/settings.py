@@ -38,6 +38,7 @@ class ParserSettings:
     parse_iteration: int = 1
     iteration_progress: int = 0
     iteration_progress_for: int = 1
+    iteration_logs_cleared_for: int = 0
     iteration_status: str = "idle"
     iteration_slot_0: int = 1
     iteration_slot_1: int = 2
@@ -64,9 +65,9 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
         "sync_from_links_sheet",
         "1",
         "Откуда брать список URL для парсинга. 1 — из листа «ссылки» (столбец A); при запуске "
-        "новые URL дописываются в конец листов «сдаваемость», «цены», «логи» (и «деталь», если включена). "
-        "0 — очередь только из уже существующих строк листа «сдаваемость»; лист «ссылки» не читается. "
-        "Удалённые из «ссылок» строки сами из других листов НЕ пропадают (см. calendar_mode / detail_fill_mode).",
+        "новые URL дописываются в конец рабочих листов, а строки с URL, которых уже нет в «ссылки», "
+        "удаляются (со смещением) на «сдаваемость», «цены», «логи» и «деталь» (если включены). "
+        "0 — очередь только из «сдаваемость»; лист «ссылки» не читается, автоудаления нет.",
     ),
     (
         "detail_range_from",
@@ -142,8 +143,9 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
     (
         "parse_iteration",
         "1",
-        "Номер текущего «прогона» по всему списку. После полного прохода всех ссылок увеличивается на 1. "
-        "Можно вручную сбросить в 1 при новом цикле мониторинга.",
+        "Номер текущего «прогона» по всему списку. После полного прохода всех ссылок парсер "
+        "сам увеличивает на 1 и останавливается (второй прогон в том же запуске не начинается). "
+        "Следующий раз — только вручную: python -m parser. Можно вручную сменить номер итерации.",
     ),
     (
         "iteration_progress",
@@ -155,6 +157,12 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
         "1",
         "Служебное: для какой итерации записан iteration_progress. При смене parse_iteration вручную "
         "парсер обнуляет прогресс. Можно не трогать.",
+    ),
+    (
+        "iteration_logs_cleared_for",
+        "0",
+        "Служебное: для какой итерации уже очищен блок логов (ит./дата/время/статус). "
+        "При новой итерации парсер сам очистит свой слот. Можно не трогать.",
     ),
     (
         "iteration_status",
@@ -232,6 +240,7 @@ def _coerce_value(name: str, raw: str) -> Any:
         "parse_iteration",
         "iteration_progress",
         "iteration_progress_for",
+        "iteration_logs_cleared_for",
         "iteration_slot_0",
         "iteration_slot_1",
         "iteration_slot_2",
@@ -352,13 +361,19 @@ def _reset_progress_if_iteration_changed(
         f"Смена итерации {prog_for} → {it}: iteration_progress сброшен в 0 "
         f"(было {settings.iteration_progress})."
     )
-    updated = replace(settings, iteration_progress=0, iteration_progress_for=it)
+    updated = replace(
+        settings,
+        iteration_progress=0,
+        iteration_progress_for=it,
+        iteration_logs_cleared_for=0,
+    )
     save_settings_values(
         sh,
         updated,
         {
             "iteration_progress": "0",
             "iteration_progress_for": str(it),
+            "iteration_logs_cleared_for": "0",
         },
     )
     return updated

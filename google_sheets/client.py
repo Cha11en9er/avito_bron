@@ -121,6 +121,46 @@ def find_row_by_url_col_a(ws: Any, url: str) -> int:
     return len(col_a) + 1
 
 
+def orphan_url_row_indices(ws: Any, allowed_canon: set[str]) -> list[int]:
+    """Номера строк (1-based), где в A — URL, которого нет в allowed_canon."""
+    col_a = ws.col_values(1)
+    rows: list[int] = []
+    for i, cell in enumerate(col_a, start=1):
+        if i == 1:
+            continue
+        c = canon_url(cell)
+        if c and c not in allowed_canon:
+            rows.append(i)
+    return rows
+
+
+def delete_worksheet_rows(ws: Any, row_numbers_1based: list[int]) -> int:
+    """Удалить строки листа (сдвиг вверх). Сначала нижние, чтобы индексы не сбивались."""
+    rows = sorted({r for r in row_numbers_1based if r > 1}, reverse=True)
+    if not rows:
+        return 0
+
+    def _do() -> None:
+        sheet_id = ws.id
+        requests = [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": r - 1,
+                        "endIndex": r,
+                    }
+                }
+            }
+            for r in rows
+        ]
+        ws.spreadsheet.batch_update({"requests": requests})
+
+    api_retry(_do)
+    return len(rows)
+
+
 def is_google_sheet_enabled() -> bool:
     return env("AVITO_GOOGLE_SHEET").lower() in ("1", "true", "yes", "on")
 
