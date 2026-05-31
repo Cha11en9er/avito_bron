@@ -39,7 +39,6 @@ class ParserSettings:
     iteration_progress: int = 0
     iteration_progress_for: int = 1
     iteration_logs_cleared_for: int = 0
-    iteration_status: str = "idle"
     iteration_slot_0: int = 1
     iteration_slot_1: int = 2
     iteration_slot_2: int = 3
@@ -72,13 +71,13 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
     (
         "detail_range_from",
         "0",
-        "С какой ссылки по счёту начать (первая = 0). Работает всегда, независимо от других режимов.",
+        "С какой строки листа начать (строка 2 = первая ссылка). 0+0 — весь список.",
     ),
     (
         "detail_range_to",
         "0",
-        "До какой ссылки (индекс НЕ входит). Примеры: 0 и 10 → первые 10 ссылок; 0 и 1 → одна ссылка; "
-        "оба 0 → весь список из «ссылок» (или из «сдаваемости», если sync_from_links_sheet=0).",
+        "До какой строки включительно. Примеры: 2 и 11 → строки 2–11; 2188 и 2188 — одна строка; "
+        "2188 и 0 — с 2188 до конца; 0 и 0 — весь список.",
     ),
     (
         "browser_restart_every",
@@ -150,25 +149,8 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
     (
         "iteration_progress",
         "0",
-        "Служебное. Старт с какой ссылки продолжать — обычно само по листу «логи»; вручную 0 = с начала списка.",
-    ),
-    (
-        "iteration_progress_for",
-        "1",
-        "Служебное: для какой итерации записан iteration_progress. При смене parse_iteration вручную "
-        "парсер обнуляет прогресс. Можно не трогать.",
-    ),
-    (
-        "iteration_logs_cleared_for",
-        "0",
-        "Служебное: для какой итерации уже очищен блок логов (ит./дата/время/статус). "
-        "При новой итерации парсер сам очистит свой слот. Можно не трогать.",
-    ),
-    (
-        "iteration_status",
-        "idle",
-        "Служебное состояние последнего запуска: idle — не запускали / готов; running — парсер работает; "
-        "complete — последняя итерация дошла до конца списка. Можно не трогать.",
+        "С какой строки продолжить: 0 — с начала (строка 2); 2188 — со строки 2188. "
+        "После полного прохода парсер сам ставит 0 и увеличивает parse_iteration.",
     ),
     (
         "iteration_slot_0",
@@ -184,6 +166,18 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
         "iteration_slot_2",
         "3",
         "Служебное: номер итерации в 3-м блоке (M–P). Кольцо из трёх последних прогонов.",
+    ),
+    (
+        "iteration_progress_for",
+        "1",
+        "Служебное: для какой итерации записан iteration_progress. При смене parse_iteration вручную "
+        "парсер обнуляет прогресс. Можно не трогать.",
+    ),
+    (
+        "iteration_logs_cleared_for",
+        "0",
+        "Служебное: для какой итерации уже очищен блок логов (ит./дата/время/статус). "
+        "При новой итерации парсер сам очистит свой слот. Можно не трогать.",
     ),
 ]
 
@@ -345,7 +339,7 @@ def load_settings(base_dir: Path, sh: Any) -> ParserSettings:
 def _reset_progress_if_iteration_changed(
     sh: Any, settings: ParserSettings, kv: dict[str, str]
 ) -> ParserSettings:
-    """Ручная смена parse_iteration → iteration_progress = 0."""
+    """Ручная смена parse_iteration → iteration_progress = 1."""
     from dataclasses import replace
 
     it = max(1, settings.parse_iteration)
@@ -358,8 +352,8 @@ def _reset_progress_if_iteration_changed(
         return settings
 
     print(
-        f"Смена итерации {prog_for} → {it}: iteration_progress сброшен в 0 "
-        f"(было {settings.iteration_progress})."
+        f"Смена итерации {prog_for} → {it}: iteration_progress сброшен на №1 "
+        f"(было №{settings.iteration_progress})."
     )
     updated = replace(
         settings,

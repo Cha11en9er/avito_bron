@@ -1,3 +1,10 @@
+"""
+Запасной парсер: сдаваемость из карусели «ближайшие даты» (старая логика).
+
+Основной режим — datepicker (4 месяца): python -m parser
+Запуск запасной версии: python -m parser.all_info_carousel
+"""
+
 from __future__ import annotations
 
 import base64
@@ -9,7 +16,7 @@ import re
 import sys
 import time
 import traceback
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any
 from pathlib import Path
 from urllib.parse import urljoin
@@ -40,12 +47,6 @@ FINAL_SCROLL_MAX_S = 1.2
 BOOKING_LOADER_CLICKS = 4
 BOOKING_CLICK_PAUSE_MS_MIN = 450
 BOOKING_CLICK_PAUSE_MS_MAX = 1100
-# Фазы карточки (~20 с): 4 + 6 + 2 + 5 (+ запись в таблицу отдельно)
-CARD_INITIAL_SETTLE_S = 4.0
-CARD_CALENDAR_PHASE_S = 6.0
-CARD_STEP_GAP_S = 2.0
-CARD_PRICE_PHASE_S = 5.0
-DATEPICKER_READY_TIMEOUT_MS = 3500
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
 BROWSER_RESTART_EVERY = 10
 URLS_FILE_NAME = "urls.txt"
@@ -170,10 +171,6 @@ def _new_page(browser):
     return context, page
 
 
-def _card_step_pause(page) -> None:
-    page.wait_for_timeout(int(CARD_STEP_GAP_S * 1000))
-
-
 def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> None:
     wait_ms = int(random.uniform(min_seconds, max_seconds) * 1000)
     page.wait_for_timeout(wait_ms)
@@ -215,16 +212,7 @@ def _page_looks_removed(page) -> bool:
     return False
 
 
-def _listing_log_start(sheet_row: int, last_row: int) -> None:
-    ts = datetime.now().strftime("%d.%m.%Y %H:%M:%S")
-    print(f"{ts}  {sheet_row}/{last_row}")
-
-
-def _listing_log_line(label: str, status: str) -> None:
-    print(f"  {label}: {status}")
-
-
-def _wait_for_item_spa_ready(page) -> None:
+def _wait_for_item_spa_ready(page, idx: int, total: int) -> None:
     """Ждём, пока карточка объявления отрисуется (а не дефолтная оболочка Авито)."""
     selectors = (
         '[data-marker="item-view/item-price"], '
@@ -232,16 +220,17 @@ def _wait_for_item_spa_ready(page) -> None:
         '[data-marker="item-view/title-info"] h1'
     )
     loc = page.locator(selectors).first
-    deadline = time.monotonic() + 18.0
+    deadline = time.monotonic() + 65.0
     while time.monotonic() < deadline:
         if _page_looks_removed(page):
             return
         try:
-            if loc.is_visible(timeout=500):
+            if loc.is_visible(timeout=1200):
                 return
         except Exception:
             pass
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(350)
+    print(f"[{idx}/{total}] Предупреждение: долго не появлялась карточка объявления")
 
 
 def _scroll_through_page(page, total_scrolls: int = 6) -> None:
@@ -931,77 +920,6 @@ def _or_not_found(value: str | None) -> str:
     return normalized if normalized else NOT_FOUND_VALUE
 
 
-def _collect_nearest_date_prices(page) -> dict[str, str]:
-    """Цены из карусели «ближайшие даты» (фаза CARD_PRICE_PHASE_S сек.)."""
-    booking_map: dict[str, tuple[str, str]] = {}
-    phase_end = time.monotonic() + CARD_PRICE_PHASE_S
-    try:
-        nd = page.locator('[data-marker="nearest-dates"]')
-        if nd.count() > 0:
-            nd.first.scroll_into_view_if_needed(timeout=5000)
-            booking_map = _collect_booking_prices_with_loaders(page, phase_end)
-    except Exception as exc:
-        print(f"  Карусель цен: {exc}")
-    return _booking_prices_to_dict(booking_map)
-
-
-def _parse_listing_calendar(
-    page,
-    url: str,
-    sheet_row: int,
-    item_id: str | int,
-    today: date,
-) -> dict[date, str]:
-    """
-    Сдаваемость из datepicker (до 4 месяцев).
-    Возвращает только даты >= today — для записи в таблицу (прошлое не перезаписываем).
-    """
-    from parser.calendar_availability import read_availability_panels
-    from parser.calendar_page import (
-        close_calendar_popup,
-        open_calendar_popup,
-        scroll_to_calendar,
-    )
-
-    calendar_in_url = "calendar=true" in url.lower()
-    availability_days: dict[date, str] = {}
-    calendar_trigger: str | None = None
-    sid = str(item_id)
-    cal_deadline = time.monotonic() + CARD_CALENDAR_PHASE_S
-
-    scroll_to_calendar(page)
-
-    def _run_calendar_parse() -> None:
-        nonlocal availability_days, calendar_trigger
-        calendar_trigger = open_calendar_popup(
-            page,
-            sheet_row,
-            sid,
-            after_open_wait_s=1.0,
-            ready_timeout_ms=DATEPICKER_READY_TIMEOUT_MS,
-            quiet=True,
-        )
-        if calendar_in_url and not calendar_trigger:
-            calendar_trigger = "calendar=true"
-        if not calendar_trigger:
-            return
-        try:
-            availability_days, _, _ = read_availability_panels(page, today)
-        except Exception:
-            traceback.print_exc()
-
-    _run_calendar_parse()
-
-    remaining = cal_deadline - time.monotonic()
-    if remaining > 0:
-        page.wait_for_timeout(int(remaining * 1000))
-
-    if not calendar_in_url and calendar_trigger:
-        close_calendar_popup(page, calendar_trigger, quiet=True)
-
-    return availability_days
-
-
 def _dump_debug_html(
     page,
     base_dir: Path,
@@ -1022,27 +940,11 @@ def _dump_debug_html(
         print(f"Debug HTML не сохранён: {exc}")
 
 
-def _sheet_write_cutoff(
-    day_at_start: date,
-    availability_days: dict[date, str],
-    booking_prices: dict[str, str],
-    listing_url: str,
-    day_session: Any,
-) -> tuple[date, dict[date, str], dict[str, str]]:
-    from google_sheets.calendar import filter_availability_day_map
-    from google_sheets.parse_day import ParseDaySession, filter_booking_prices, write_cutoff_for_listing
-
-    write_cutoff = write_cutoff_for_listing(day_at_start)
-    availability_days = filter_availability_day_map(availability_days, write_cutoff)
-    booking_prices = filter_booking_prices(booking_prices, write_cutoff)
-    if day_session is not None and hasattr(day_session, "note_url_completed"):
-        day_session.note_url_completed(listing_url, write_cutoff)
-    return write_cutoff, availability_days, booking_prices
-
-
 def _maybe_append_google_sheet(
     record: dict,
     base_dir: Path,
+    idx: int,
+    total: int,
     item_id: int,
     booking_prices: dict[str, str],
     listing_url: str,
@@ -1050,20 +952,21 @@ def _maybe_append_google_sheet(
     sh: Any = None,
     settings: Any = None,
     removed: bool = False,
-    queue_next_row: int | None = None,
-    availability_days: dict[date, str] | None = None,
-    sheet_today: date | None = None,
-) -> bool:
+    queue_next_index: int | None = None,
+    availability_days: dict | None = None,
+    sheet_today: object | None = None,
+) -> None:
     if os.environ.get("AVITO_GOOGLE_SHEET", "").lower() not in ("1", "true", "yes", "on"):
-        return True
+        return
     if sh is None or settings is None:
-        return True
+        return
     try:
         from google_sheets import sync_after_listing
     except ImportError:
-        return False
+        print(f"[{idx}/{total}] Google Sheet: пакет google_sheets недоступен")
+        return
     try:
-        ok, _wrote = sync_after_listing(
+        ok, wrote = sync_after_listing(
             sh,
             settings,
             record,
@@ -1071,109 +974,76 @@ def _maybe_append_google_sheet(
             booking_prices,
             listing_url,
             removed=removed,
-            queue_next_index=queue_next_row,
-            availability_days=availability_days if not removed else None,
+            queue_next_index=queue_next_index,
+            availability_days=availability_days,
             today=sheet_today,
         )
-        return ok
-    except Exception:
-        return False
+        print(f"[{idx}/{total}] Google Sheet ({wrote}): {'ок' if ok else 'проблема'}")
+    except Exception as exc:
+        print(f"[{idx}/{total}] id={item_id} Google Sheet: {exc}")
 
 
 def _process_one_url(
     page,
     base_dir: Path,
     url: str,
-    sheet_row: int,
-    last_row: int,
+    idx: int,
+    total: int,
     *,
     sh: Any = None,
     settings: Any = None,
-    queue_next_row: int | None = None,
-    day_session: Any = None,
+    queue_next_index: int | None = None,
 ) -> dict | None:
-    try:
-        from google_sheets.calendar import today_moscow
-        from google_sheets.parse_day import ParseDaySession
-    except ImportError:
-
-        def today_moscow() -> date:  # type: ignore[misc]
-            return datetime.now().date()
-
-        ParseDaySession = None  # type: ignore[misc, assignment]
-
-    item_id = _extract_id_from_url(url) or sheet_row
-    day_at_start = today_moscow()
-
-    if (
-        day_session is not None
-        and ParseDaySession is not None
-        and isinstance(day_session, ParseDaySession)
-        and day_session.should_skip_repeat(url)
-    ):
-        _listing_log_start(sheet_row, last_row)
-        _listing_log_line("пропуск", "уже до смены дня")
-        return {"ссылка": url, "номер": item_id}
-
-    _listing_log_start(sheet_row, last_row)
+    item_id = _extract_id_from_url(url) or idx
+    t_link_start = time.monotonic()
+    print(f"[{idx}/{total}] Открываю: {url}")
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    _wait_for_item_spa_ready(page)
+    _human_pause(page, 0.3, 0.7)
+    _simulate_human_activity(page)
+    _wait_for_item_spa_ready(page, idx, total)
+    _human_pause(page, 0.35, 0.9)
 
     title_early = _extract_title(page) or f"house_{item_id}"
     if is_listing_removed(title_early):
-        write_cutoff, _, _ = _sheet_write_cutoff(day_at_start, {}, {}, url, day_session)
         record = {"ссылка": url, "название": NOT_FOUND_VALUE}
         for col in EXPORT_COLUMNS:
             if col not in ("ссылка",):
                 record[col] = NOT_FOUND_VALUE
-        ok = _maybe_append_google_sheet(
-            record, base_dir, item_id, {}, url,
-            sh=sh, settings=settings, removed=True, queue_next_row=queue_next_row,
-            sheet_today=write_cutoff,
+        _maybe_append_google_sheet(
+            record, base_dir, idx, total, item_id, {}, url,
+            sh=sh, settings=settings, removed=True, queue_next_index=queue_next_index,
         )
-        _listing_log_line("брони", "нет на сайте")
-        _listing_log_line("цены", "—")
-        _listing_log_line("запись", "ок" if ok else "ошибка")
+        print(f"[{idx}/{total}] id={item_id} снято с сайта")
         return record
 
-    page.wait_for_timeout(int(CARD_INITIAL_SETTLE_S * 1000))
+    print(
+        f"[{idx}/{total}] Сценарий на карточке: пауза {INITIAL_WAIT_MIN_S:.1f}-{INITIAL_WAIT_MAX_S:.1f} с, "
+        f"лёгкий скролл {LIGHT_SCROLL_PHASE_MIN_S:.1f}-{LIGHT_SCROLL_PHASE_MAX_S:.1f} с, "
+        f"бронь до {BOOKING_PHASE_MAX_S:.1f} с, финальный скролл {FINAL_SCROLL_MIN_S:.1f}-{FINAL_SCROLL_MAX_S:.1f} с."
+    )
+    page.wait_for_timeout(int(random.uniform(INITIAL_WAIT_MIN_S, INITIAL_WAIT_MAX_S) * 1000))
+    _scroll_for_duration(page, LIGHT_SCROLL_PHASE_MIN_S, LIGHT_SCROLL_PHASE_MAX_S)
 
-    availability_days = _parse_listing_calendar(page, url, sheet_row, item_id, day_at_start)
-    _card_step_pause(page)
+    booking_map: dict[str, tuple[str, str]] = {}
+    booking_phase_end = time.monotonic() + random.uniform(BOOKING_PHASE_MIN_S, BOOKING_PHASE_MAX_S)
+    try:
+        nd = page.locator('[data-marker="nearest-dates"]')
+        if nd.count() > 0:
+            nd.first.scroll_into_view_if_needed(timeout=12000)
+            _human_pause(page, 0.2, 0.55)
+            booking_map = _collect_booking_prices_with_loaders(page, booking_phase_end)
+    except Exception as exc:
+        print(f"[{idx}/{total}] id={item_id} Блок ближайших дат: {exc}")
 
-    booking_prices = _collect_nearest_date_prices(page)
-    bron = "ок" if availability_days else "пусто"
-    ceny = "ок" if booking_prices else "пусто"
-    _listing_log_line("брони", bron)
-    _listing_log_line("цены", ceny)
-
-    _dump_debug_html(page, base_dir, settings, item_id)
-
-    write_cutoff, availability_days, booking_prices = _sheet_write_cutoff(
-        day_at_start, availability_days, booking_prices, url, day_session,
+    _scroll_for_duration(page, FINAL_SCROLL_MIN_S, FINAL_SCROLL_MAX_S)
+    _human_pause(page, 0.2, 0.5)
+    t_card_done = time.monotonic()
+    print(
+        f"[{idx}/{total}] id={item_id} фазы карточки (пауза+скролл+бронь): "
+        f"{t_card_done - t_link_start:.1f} с, слотов брони: {len(booking_map)}"
     )
 
-    run_detail = settings.run_detail if settings else True
-    if not run_detail:
-        booking_cell = (
-            json.dumps(booking_prices, ensure_ascii=False)
-            if booking_prices
-            else NOT_FOUND_VALUE
-        )
-        record: dict[str, Any] = {
-            "номер": item_id,
-            "ссылка": url,
-            "цены по датам": booking_cell,
-        }
-        for col in EXPORT_COLUMNS:
-            record.setdefault(col, NOT_FOUND_VALUE)
-        ok = _maybe_append_google_sheet(
-            record, base_dir, item_id, booking_prices, url,
-            sh=sh, settings=settings, removed=False, queue_next_row=queue_next_row,
-            availability_days=availability_days, sheet_today=write_cutoff,
-        )
-        _listing_log_line("запись", "ок" if ok else "ошибка")
-        return record
+    _dump_debug_html(page, base_dir, settings, item_id)
 
     title = _extract_title(page) or f"house_{item_id}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1187,7 +1057,7 @@ def _process_one_url(
             timestamp=timestamp,
         )
     except Exception as exc:
-        pass
+        print(f"[{idx}/{total}] id={item_id} Не удалось сохранить картинку телефона: {exc}")
         phone_image_path = None
 
     phone_number: str | None = None
@@ -1195,14 +1065,14 @@ def _process_one_url(
         try:
             phone_number = _ocr_phone_number(phone_image_path)
         except Exception as exc:
-            pass
+            print(f"[{idx}/{total}] id={item_id} Ошибка OCR телефона: {exc}")
             phone_number = None
     if phone_image_path and phone_number:
         try:
             Path(phone_image_path).unlink(missing_ok=True)
             phone_image_path = None
         except Exception as exc:
-            pass
+            print(f"[{idx}/{total}] id={item_id} Не удалось удалить картинку телефона: {exc}")
 
     price = _extract_price(page)
     address = _extract_address(page)
@@ -1214,6 +1084,7 @@ def _process_one_url(
     # В таблице одна строка — без «лестницы» из URL в ячейке.
     photos_cell = " ".join(gallery_urls) if gallery_urls else NOT_FOUND_VALUE
     details_json = json.dumps(details, ensure_ascii=False) if details else ""
+    booking_prices = _booking_prices_to_dict(booking_map)
     booking_cell = json.dumps(booking_prices, ensure_ascii=False) if booking_prices else NOT_FOUND_VALUE
 
     record = {
@@ -1254,12 +1125,14 @@ def _process_one_url(
     if _normalize_space(seller_profile):
         record["ссылка создателя"] = _normalize_space(seller_profile)
 
-    ok = _maybe_append_google_sheet(
-        record, base_dir, item_id, booking_prices, url,
-        sh=sh, settings=settings, removed=False, queue_next_row=queue_next_row,
-        availability_days=availability_days, sheet_today=write_cutoff,
+    _maybe_append_google_sheet(
+        record, base_dir, idx, total, item_id, booking_prices, url,
+        sh=sh, settings=settings, removed=False, queue_next_index=queue_next_index,
     )
-    _listing_log_line("запись", "ок" if ok else "ошибка")
+    print(
+        f"[{idx}/{total}] id={item_id} готово: {_or_not_found(title)} "
+        f"(всего {time.monotonic() - t_link_start:.1f} с на ссылку)"
+    )
     return record
 
 
@@ -1268,42 +1141,33 @@ def main() -> None:
 
     base_dir = project_root()
 
-    sh, settings, urls, start_index, full_queue_len = _load_urls(base_dir)
+    sh, settings, urls, start_offset, full_queue_len = _load_urls(base_dir)
     if not urls:
         print("Нечего парсить.")
         return
 
-    from google_sheets.link_index import index_to_row, last_data_row
-
     restart_every = settings.browser_restart_every if settings else BROWSER_RESTART_EVERY
-    last_row = last_data_row(full_queue_len)
-    first_row = index_to_row(start_index)
     print(
         f"К обработке {len(urls)} ссылок "
         f"(итерация {settings.parse_iteration if settings else 1}, "
-        f"со строки {first_row} из {last_row})."
+        f"с #{start_offset + 1} из {full_queue_len})."
     )
 
     processed_ok = 0
-    try:
-        from google_sheets.calendar import today_moscow
-        from google_sheets.parse_day import ParseDaySession
-
-        day_session = ParseDaySession(iteration_day=today_moscow())
-        print(f"День начала итерации (MSK): {day_session.iteration_day.isoformat()}")
-    except ImportError:
-        day_session = None
-
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context, page = _new_page(browser)
         parsed_in_session = 0
         try:
-            for batch_pos, url in enumerate(urls, start=1):
-                sheet_row = index_to_row(start_index + batch_pos - 1)
-                next_row = sheet_row + 1
+            total = len(urls)
+            for local_idx, url in enumerate(urls, start=1):
+                idx = start_offset + local_idx
+                next_index = idx
                 if parsed_in_session >= restart_every:
-                    print(f"Перезапуск браузера после {restart_every} объявлений…")
+                    print(
+                        f"[{idx}/{total}] Перезапуск браузера после {restart_every} "
+                        "успешно обработанных объявлений..."
+                    )
                     try:
                         context.close()
                     except Exception:
@@ -1321,16 +1185,14 @@ def main() -> None:
                         page,
                         base_dir,
                         url,
-                        sheet_row,
-                        last_row,
+                        local_idx,
+                        total,
                         sh=sh,
                         settings=settings,
-                        queue_next_row=next_row,
-                        day_session=day_session,
+                        queue_next_index=next_index,
                     )
                 except Exception as exc:
-                    _listing_log_start(sheet_row, last_row)
-                    _listing_log_line("ошибка", str(exc)[:80])
+                    print(f"[{idx}/{total}] Ошибка обработки {url}: {exc}")
                     traceback.print_exc()
                     record = None
 
@@ -1345,11 +1207,12 @@ def main() -> None:
                 try:
                     from google_sheets import finish_parse_session
 
+                    final_progress = start_offset + processed_ok
                     finish_parse_session(
                         sh,
                         settings,
                         full_queue_len=full_queue_len,
-                        final_progress=index_to_row(start_index + processed_ok),
+                        final_progress=final_progress,
                     )
                 except ImportError:
                     pass

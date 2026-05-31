@@ -10,6 +10,7 @@ from google_sheets.client import api_retry, ensure_worksheet, find_row_by_url_co
 from google_sheets.constants import (
     BOOKED_SLOT_MARKER,
     NOT_FOUND_ON_SITE,
+    REMOVED_LISTING_FORWARD_DAYS,
     RE_DATA_ID_PERIOD,
     RE_PERIOD,
     RE_PERIOD_CROSS_MONTH,
@@ -30,6 +31,11 @@ def tz_moscow() -> ZoneInfo:
 
 def today_moscow() -> date:
     return datetime.now(tz_moscow()).date()
+
+
+def filter_availability_day_map(day_map: dict[date, str], cutoff: date) -> dict[date, str]:
+    """Только даты >= cutoff (прошлые ячейки листа не перезаписываем)."""
+    return {d: v for d, v in (day_map or {}).items() if d >= cutoff}
 
 
 def month_from_russian(word: str) -> int | None:
@@ -330,6 +336,46 @@ def open_calendar_ws(sh: Any, settings: ParserSettings, *, availability: bool) -
     return ws
 
 
+def removed_listing_dates(today: date, forward_days: int = REMOVED_LISTING_FORWARD_DAYS) -> set[date]:
+    """Дни для «нету на сайте», если объявление снято (сегодня + forward_days−1)."""
+    n = max(1, forward_days)
+    return {today + timedelta(days=i) for i in range(n)}
+
+
+def _read_row_values_by_date(
+    ws: Any, row: int, col_by_date: dict[date, int]
+) -> dict[date, str]:
+    """Текущие значения ячеек строки по датам (из заголовка)."""
+    row_vals = ws.row_values(row)
+    out: dict[date, str] = {}
+    for d, col in col_by_date.items():
+        idx = col - 1
+        if idx < len(row_vals):
+            out[d] = (row_vals[idx] or "").strip()
+    return out
+
+
+def _extend_live_day_map_after_not_found(
+    day_map: dict[date, str],
+    col_by_date: dict[date, int],
+    existing: dict[date, str],
+    today: date,
+) -> dict[date, str]:
+    """
+    Объявление снова на сайте: с today — 0/1/цена/пусто;
+    даты < today с «нету на сайте» в day_map не попадают (сохраняются на листе).
+    """
+    out = dict(day_map)
+    for d in col_by_date:
+        if d < today:
+            continue
+        if existing.get(d) != NOT_FOUND_ON_SITE:
+            continue
+        if d not in out:
+            out[d] = ""
+    return out
+
+
 def _batch_updates_for_row(
     row: int,
     col_by_date: dict[date, int],
@@ -337,19 +383,64 @@ def _batch_updates_for_row(
     today: date,
     *,
     allow_past: bool = False,
+    existing_by_date: dict[date, str] | None = None,
 ) -> list[dict[str, Any]]:
     from gspread.utils import rowcol_to_a1
 
     body: list[dict[str, Any]] = []
     for d, val in day_values.items():
-        if not allow_past and d < today:
-            continue
+        if d < today:
+            if not allow_past:
+                continue
+            if existing_by_date and existing_by_date.get(d) == NOT_FOUND_ON_SITE:
+                continue
         col = col_by_date.get(d)
         if not col:
             continue
         a1 = rowcol_to_a1(row, col)
         body.append({"range": a1, "values": [[val]]})
     return body
+
+
+def update_availability_day_map(
+    sh: Any,
+    settings: ParserSettings,
+    listing_url: str,
+    day_map: dict[date, str],
+    today: date,
+) -> tuple[int, str]:
+    """
+    Запись сдаваемости из datepicker (0/1).
+    Обновляются только столбцы с датой >= today: прошлые дни в листе не перезаписываются
+    (в календаре на сайте они выглядят «занято», но это не снимает старые 0 в таблице).
+    """
+    ws = open_calendar_ws(sh, settings, availability=True)
+    rows = ws.get_all_values()
+    if not rows:
+        return 0, "лист пуст"
+
+    headers = rows[0] or ["Объявление"]
+    if not day_map:
+        return 0, "нет дней в календаре"
+
+    col_by = ensure_calendar_headers(ws, set(day_map.keys()), today, settings)
+    row = find_row_by_url_col_a(ws, listing_url)
+    _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
+
+    existing_by_date = _read_row_values_by_date(ws, row, col_by)
+    values = _extend_live_day_map_after_not_found(day_map, col_by, existing_by_date, today)
+
+    updates = _batch_updates_for_row(
+        row, col_by, values, today, existing_by_date=existing_by_date
+    )
+    if not updates:
+        return 0, "нечего писать"
+
+    def _do_batch() -> None:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+    api_retry(_do_batch)
+    return len(updates), "ок"
 
 
 def update_calendar_sheet(
@@ -373,10 +464,13 @@ def update_calendar_sheet(
     slots = collect_booking_slots(booking, today)
 
     if listing_removed:
-        col_by = ensure_calendar_headers(ws, set(), today, settings)
+        needed_removed = removed_listing_dates(today)
+        col_by = ensure_calendar_headers(ws, needed_removed, today, settings)
         if not col_by:
             return 0, "нет столбцов дат"
-        day_map = {d: NOT_FOUND_ON_SITE for d in col_by}
+        day_map = {
+            d: NOT_FOUND_ON_SITE for d in needed_removed if d in col_by
+        }
     elif not slots:
         return 0, "нет слотов брони"
     else:
@@ -391,12 +485,19 @@ def update_calendar_sheet(
     row = find_row_by_url_col_a(ws, listing_url)
     _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
 
+    existing_by_date = _read_row_values_by_date(ws, row, col_by)
+    if not listing_removed:
+        day_map = _extend_live_day_map_after_not_found(
+            day_map, col_by, existing_by_date, today
+        )
+
     updates = _batch_updates_for_row(
         row,
         col_by,
         day_map,
         today,
         allow_past=listing_removed,
+        existing_by_date=existing_by_date,
     )
     if not updates:
         return 0, "нечего писать"

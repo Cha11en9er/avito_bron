@@ -7,7 +7,7 @@
 ```
 avito_bron/
 ├── google_sheets/     # Google Таблица (настройки, листы, запись)
-├── parser/            # парсер Avito: python -m parser
+├── parser/            # python -m parser (datepicker 4 мес.) | запасной: python -m parser.all_info_carousel
 ├── kadastr/           # кадастр
 └── docs/              # документация
 ```
@@ -31,7 +31,7 @@ python -m parser
 | `run_detail` | `0` |
 | `run_calendar` | `1` |
 | `sync_from_links_sheet` | `0` |
-| `detail_range_from` | `0` |
+| `detail_range_from` | `1` |
 | `detail_range_to` | `10` |
 
 Запуск: `python -m parser`.  

@@ -6,7 +6,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+_queue_len: int = 0
+
+
+def set_queue_len(n: int) -> None:
+    global _queue_len
+    _queue_len = max(0, n)
+
+
+def current_queue_len() -> int | None:
+    return _queue_len if _queue_len > 0 else None
+
 from google_sheets.calendar import today_moscow, tz_moscow
+from google_sheets.link_index import (
+    FIRST_DATA_ROW,
+    index_to_row,
+    last_data_row,
+    progress_to_start_index,
+    row_to_index,
+)
 from google_sheets.client import (
     api_retry,
     canon_url,
@@ -157,11 +175,11 @@ def _slot_columns(settings: ParserSettings, iteration_number: int) -> tuple[int,
 
 
 def _should_clear_logs_slot(settings: ParserSettings, iteration_number: int) -> bool:
-    """Новая итерация или явный перезапуск с progress=0 — очистить блок логов слота."""
+    """Новая итерация или iteration_progress=0 — очистить блок логов слота."""
     it = max(1, iteration_number)
     if settings.iteration_logs_cleared_for != it:
         return True
-    if settings.iteration_progress == 0 and (settings.iteration_status or "").strip() != "running":
+    if settings.iteration_progress <= 0:
         return True
     return False
 
@@ -278,12 +296,11 @@ def resolve_start_index_from_logs(
 ) -> int:
     """
     Первая ссылка в очереди без статуса в логах для parse_iteration.
-    Если логи стёрты — снова с 0, даже при iteration_progress > 0.
     """
     if not queue:
         return 0
     if not settings.run_calendar:
-        return max(0, settings.iteration_progress)
+        return progress_to_start_index(settings.iteration_progress)
 
     status_by_url = _log_status_by_url(sh, settings)
     for i, url in enumerate(queue):
@@ -292,55 +309,117 @@ def resolve_start_index_from_logs(
     return len(queue)
 
 
+def roll_to_next_iteration_if_queue_done(
+    sh: Any,
+    settings: ParserSettings,
+    queue: list[str],
+) -> ParserSettings:
+    """
+    Прошлый прогон дошёл до конца (в настройках строка за пределами списка
+    или все строки с «ок» в логах) — новая итерация, iteration_progress=0.
+    """
+    from dataclasses import replace
+
+    n = len(queue)
+    if n == 0:
+        return settings
+
+    stored_idx = progress_to_start_index(settings.iteration_progress)
+    need_roll = stored_idx >= n
+
+    if not need_roll and settings.run_calendar:
+        from_logs = resolve_start_index_from_logs(sh, settings, queue)
+        if from_logs >= n and stored_idx == 0:
+            need_roll = True
+
+    if not need_roll:
+        return settings
+
+    old_it = max(1, settings.parse_iteration)
+    settings = complete_iteration(sh, settings, total_links=n)
+    settings = begin_iteration(sh, replace(settings, iteration_logs_cleared_for=0), urls=queue)
+    print(
+        f"Новый запуск: итерация {old_it} была завершена, "
+        f"старт итерации {settings.parse_iteration} с iteration_progress=0 (строка 2)."
+    )
+    return settings
+
+
 def slice_queue_for_resume(
     sh: Any,
     queue: list[str],
     settings: ParserSettings,
-) -> tuple[list[str], int]:
-    stored = max(0, settings.iteration_progress)
-    from_logs = resolve_start_index_from_logs(sh, settings, queue)
-    start = from_logs
+) -> tuple[list[str], int, ParserSettings]:
+    """
+    Старт очереди: max(логи, iteration_progress).
+    iteration_progress: 0 = с начала; иначе номер строки листа.
+    """
+    settings = roll_to_next_iteration_if_queue_done(sh, settings, queue)
 
-    if start != stored:
+    stored_idx = progress_to_start_index(settings.iteration_progress)
+    stored_row = index_to_row(stored_idx) if stored_idx > 0 else 0
+    from_logs = (
+        resolve_start_index_from_logs(sh, settings, queue)
+        if settings.run_calendar
+        else stored_idx
+    )
+    start_idx = max(from_logs, stored_idx) if settings.run_calendar else stored_idx
+
+    if settings.run_calendar and start_idx > stored_idx:
+        new_row = index_to_row(start_idx)
         save_settings_values(
             sh,
             settings,
             {
-                "iteration_progress": str(start),
+                "iteration_progress": str(new_row),
                 "iteration_progress_for": str(max(1, settings.parse_iteration)),
             },
         )
-        if stored > 0 and start < stored:
-            print(
-                f"Итерация {settings.parse_iteration}: в настройках прогресс {stored}, "
-                f"в логах заполнено {start} — начинаем с ссылки {start + 1}."
-            )
-        elif stored > 0 and start > stored:
-            print(
-                f"Итерация {settings.parse_iteration}: прогресс в настройках "
-                f"обновлён {stored} → {start} по логам."
-            )
-
-    if start >= len(queue):
-        return [], start
-    if start > 0:
         print(
-            f"Итерация {settings.parse_iteration}: продолжение с ссылки "
-            f"{start + 1}/{len(queue)} (в логах уже {start})."
+            f"Итерация {settings.parse_iteration}: строка в настройках "
+            f"{stored_row or 0} → {new_row} по логам."
         )
-    return queue[start:], start
+
+    if start_idx >= len(queue):
+        return [], start_idx, settings
+
+    if start_idx > 0:
+        row = index_to_row(start_idx)
+        from_row = index_to_row(from_logs)
+        if stored_idx > from_logs:
+            print(
+                f"Итерация {settings.parse_iteration}: старт со строки {row} "
+                f"(в настройках {stored_row}; в логах до {from_row})."
+            )
+        else:
+            print(
+                f"Итерация {settings.parse_iteration}: продолжение со строки {row} "
+                f"(в логах до {from_row})."
+            )
+    return queue[start_idx:], start_idx, settings
 
 
-def save_iteration_progress(sh: Any, settings: ParserSettings, next_index: int) -> None:
+def save_iteration_progress(
+    sh: Any,
+    settings: ParserSettings,
+    next_sheet_row: int,
+    *,
+    total_urls: int | None = None,
+) -> ParserSettings:
+    """next_sheet_row — следующая строка после обработанной; при конце списка — новая итерация."""
     it = max(1, settings.parse_iteration)
+    if total_urls and next_sheet_row > last_data_row(total_urls):
+        return complete_iteration(sh, settings, total_links=total_urls)
+
     save_settings_values(
         sh,
         settings,
         {
-            "iteration_progress": str(next_index),
+            "iteration_progress": str(next_sheet_row),
             "iteration_progress_for": str(it),
         },
     )
+    return settings
 
 
 def begin_iteration(
@@ -368,7 +447,6 @@ def begin_iteration(
             "iteration_slot_0": str(settings.iteration_slot_0),
             "iteration_slot_1": str(settings.iteration_slot_1),
             "iteration_slot_2": str(settings.iteration_slot_2),
-            "iteration_status": "running",
             "iteration_logs_cleared_for": str(settings.iteration_logs_cleared_for),
         },
     )
@@ -376,7 +454,7 @@ def begin_iteration(
 
 
 def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -> ParserSettings:
-    """Все ссылки итерации обработаны — следующая итерация, прогресс 0."""
+    """Все ссылки итерации обработаны — следующая итерация, iteration_progress=0."""
     from dataclasses import replace
 
     old_it = max(1, settings.parse_iteration)
@@ -389,7 +467,7 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
             "parse_iteration": str(new_it),
             "iteration_progress": "0",
             "iteration_progress_for": str(new_it),
-            "iteration_status": "complete",
+            "iteration_logs_cleared_for": "0",
             "iteration_slot_0": str(settings.iteration_slot_0),
             "iteration_slot_1": str(settings.iteration_slot_1),
             "iteration_slot_2": str(settings.iteration_slot_2),
@@ -397,13 +475,13 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
     )
     print(
         f"Итерация {old_it} завершена ({total_links} ссылок). "
-        f"В настройках: parse_iteration={new_it}, iteration_progress=0. "
-        f"Парсер остановлен — новый прогон только после ручного запуска "
-        f"(итерация {new_it}, логи в слоте {slot_iteration_ids(settings)})."
+        f"В настройках: parse_iteration={new_it}, iteration_progress=0 "
+        f"(следующий запуск — со строки 2)."
     )
     return replace(
         settings,
         parse_iteration=new_it,
         iteration_progress=0,
         iteration_progress_for=new_it,
+        iteration_logs_cleared_for=0,
     )

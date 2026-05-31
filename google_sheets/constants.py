@@ -15,6 +15,8 @@ DEFAULT_WORKSHEET_LOGS = "логи ежедневного парсинга"
 DEFAULT_WORKSHEET_KADASTR = "детальная информация с кадастрами"
 
 NOT_FOUND_ON_SITE = "нету на сайте"
+# Снято с сайта: помечать только с даты парсинга на N дней вперёд (вкл. сегодня).
+REMOVED_LISTING_FORWARD_DAYS = 4
 # Маркер в booking[период]: слот на сайте без цены (занято / есть бронь)
 BOOKED_SLOT_MARKER = "__booked__"
 LOG_STATUS_OK = "ок"

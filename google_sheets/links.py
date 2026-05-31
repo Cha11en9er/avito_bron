@@ -20,6 +20,7 @@ from google_sheets.detail import (
     title_needs_parse,
 )
 from google_sheets.calendar import init_calendar_sheet
+from google_sheets.link_index import slice_queue_by_range
 from google_sheets.settings import ParserSettings
 
 
@@ -66,20 +67,8 @@ def load_urls_from_calendar_sheet(sh: Any, settings: ParserSettings) -> list[str
 
 
 def apply_link_range(urls: list[str], settings: ParserSettings) -> list[str]:
-    """Диапазон индексов [from, to): 0+0 = все; 0+1 = одна ссылка; 0+10 = десять."""
-    if not urls:
-        return []
-    start = max(0, settings.detail_range_from)
-    end = settings.detail_range_to
-    if start == 0 and end == 0:
-        return list(urls)
-    if end < 0:
-        return urls[start:]
-    if end <= start:
-        return []
-    sliced = urls[start:end]
-    print(f"Диапазон ссылок [{start}:{end}) → {len(sliced)} шт.")
-    return sliced
+    """См. slice_queue_by_range: номера ссылок 1-based, 0+0 = все."""
+    return slice_queue_by_range(urls, settings.detail_range_from, settings.detail_range_to)
 
 
 def load_url_list(base_dir: Path, settings: ParserSettings, sh: Any) -> list[str]:
@@ -195,9 +184,11 @@ def prepare_workbook(
     export_columns: list[str],
     sh: Any,
     all_urls: list[str],
+    *,
+    links_master: list[str] | None = None,
 ) -> None:
     if settings.sync_from_links_sheet:
-        full_links = load_urls_from_links_sheet(base_dir, settings, sh=sh)
+        full_links = links_master or load_urls_from_links_sheet(base_dir, settings, sh=sh)
         if settings.detail_fill_mode in ("primary", "rebuild") and settings.run_detail:
             rebuild_detail_sheet(sh, settings, full_links, export_columns)
         if settings.calendar_mode == "primary" and settings.run_calendar:
@@ -221,7 +212,9 @@ def build_parse_queue(
         print("Список URL пуст после применения диапазона.")
         return sh, []
 
-    prepare_workbook(base_dir, settings, export_columns, sh, all_urls)
+    prepare_workbook(
+        base_dir, settings, export_columns, sh, all_urls, links_master=links_master
+    )
 
     sync_kw = {"links_master": links_master} if links_master is not None else {}
 
