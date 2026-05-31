@@ -205,7 +205,7 @@ def _print_listing_report(
     print("Ссылка:")
     print(f"  {url}")
     print()
-    print("Брони (календарь, до 4 месяцев):")
+    print("Брони (календарь, 2 месяца):")
     for line in _lines_availability(availability_days):
         print(line)
     print()

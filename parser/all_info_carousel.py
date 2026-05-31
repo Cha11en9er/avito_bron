@@ -1,7 +1,7 @@
 """
 Запасной парсер: сдаваемость из карусели «ближайшие даты» (старая логика).
 
-Основной режим — datepicker (4 месяца): python -m parser
+Основной режим — datepicker (2 месяца): python -m parser
 Запуск запасной версии: python -m parser.all_info_carousel
 """
 

@@ -150,7 +150,7 @@ def sync_after_listing_calendar(
     queue_next_index: int | None = None,  # номер следующей ссылки (1-based)
     today: date | None = None,
 ) -> tuple[bool, str]:
-    """Сдаваемость из datepicker (4 мес.), цены — из карусели «ближайшие даты»."""
+    """Сдаваемость из datepicker (2 мес.), цены — из карусели «ближайшие даты»."""
     sheet_today = today if today is not None else today_moscow()
     availability_days = filter_availability_day_map(availability_days, sheet_today)
     booking_prices = filter_booking_prices(booking_prices, sheet_today)

@@ -1,4 +1,4 @@
-"""Сдаваемость из datepicker Avito: 2 месяца как открылись + 2 клика «вперёд» (всего 4 месяца)."""
+"""Сдаваемость из datepicker Avito: только 2 месяца (две панели в попапе, без листания вперёд)."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import Any, Literal
 DayState = Literal["free", "booked", "skip"]
 
 INITIAL_PANEL_COUNT = 2
-TOTAL_MONTH_COUNT = 4
-EXTRA_MONTH_NAV_CLICKS = 2
+TOTAL_MONTH_COUNT = 2
+EXTRA_MONTH_NAV_CLICKS = 0
 DATEPICKER_READY_MS = 5000
 DATEPICKER_READY_AFTER_NAV_MS = 4000
 
@@ -339,9 +339,8 @@ def _add_month_from_nav(
 
 def read_availability_panels(page, today: date) -> tuple[dict[date, str], dict[date, str], list[str]]:
     """
-    1) Две панели как в попапе (заголовок «Май 2026» и т.д.).
-    2) Два клика «следующий месяц» — 3-й и 4-й месяцы (без дублей).
-    В таблицу попадают только даты >= today (прошлые ячейки не трогаем).
+    Две панели datepicker как на экране (без кнопки «следующий месяц»).
+    В таблицу попадают только даты >= today.
     """
     _nudge_second_panel(page)
     wait_datepicker_ready(page, timeout_ms=DATEPICKER_READY_MS, min_day_labels=14)

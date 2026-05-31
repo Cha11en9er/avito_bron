@@ -7,7 +7,7 @@
 ```
 avito_bron/
 ├── google_sheets/     # Google Таблица (настройки, листы, запись)
-├── parser/            # python -m parser (datepicker 4 мес.) | запасной: python -m parser.all_info_carousel
+├── parser/            # python -m parser (datepicker 2 мес.) | запасной: python -m parser.all_info_carousel
 ├── kadastr/           # кадастр
 └── docs/              # документация
 ```

@@ -953,7 +953,7 @@ def _parse_listing_calendar(
     today: date,
 ) -> dict[date, str]:
     """
-    Сдаваемость из datepicker (до 4 месяцев).
+    Сдаваемость из datepicker (2 месяца, без листания).
     Возвращает только даты >= today — для записи в таблицу (прошлое не перезаписываем).
     """
     from parser.calendar_availability import read_availability_panels
