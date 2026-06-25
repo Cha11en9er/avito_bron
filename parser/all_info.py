@@ -1380,6 +1380,9 @@ def _process_one_url(
     _listing_log_write(sheet_worker, ok)
     _ensure_listing_pace(page, listing_started)
     return record
+
+
+def main() -> None:
     _setup_playwright_env()
 
     base_dir = project_root()
