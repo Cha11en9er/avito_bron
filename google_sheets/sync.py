@@ -68,6 +68,7 @@ def sync_after_listing(
     queue_next_index: int | None = None,  # номер следующей ссылки (1-based)
     availability_days: dict[date, str] | None = None,
     today: date | None = None,
+    save_progress: bool = True,
 ) -> tuple[bool, str]:
     """Синхронизация после карточки.
 
@@ -124,7 +125,7 @@ def sync_after_listing(
     if settings.run_calendar:
         write_log_entry(sh, settings, listing_url, status=log_status, ok=ok)
 
-    if queue_next_index is not None:
+    if queue_next_index is not None and save_progress:
         from google_sheets.iterations import current_queue_len
 
         save_iteration_progress(

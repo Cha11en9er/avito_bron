@@ -1053,10 +1053,27 @@ def _maybe_append_google_sheet(
     queue_next_row: int | None = None,
     availability_days: dict[date, str] | None = None,
     sheet_today: date | None = None,
+    sheet_buffer: Any = None,
 ) -> bool:
     if os.environ.get("AVITO_GOOGLE_SHEET", "").lower() not in ("1", "true", "yes", "on"):
         return True
     if sh is None or settings is None:
+        return True
+    if sheet_buffer is not None:
+        from google_sheets.batch_sync import PendingListingSync
+
+        sheet_buffer.add(
+            PendingListingSync(
+                record=record,
+                columns=EXPORT_COLUMNS,
+                booking_prices=booking_prices,
+                listing_url=listing_url,
+                removed=removed,
+                queue_next_row=queue_next_row,
+                availability_days=availability_days if not removed else None,
+                sheet_today=sheet_today,
+            )
+        )
         return True
     try:
         from google_sheets import sync_after_listing
@@ -1080,6 +1097,19 @@ def _maybe_append_google_sheet(
         return False
 
 
+def _listing_log_write(sheet_buffer: Any, ok: bool | None = None) -> None:
+    if sheet_buffer is not None:
+        if sheet_buffer.last_add_flushed:
+            _listing_log_line("запись", "пакет")
+        else:
+            _listing_log_line(
+                "запись",
+                f"буфер {len(sheet_buffer)}/{sheet_buffer.batch_size}",
+            )
+    else:
+        _listing_log_line("запись", "ок" if ok else "ошибка")
+
+
 def _process_one_url(
     page,
     base_dir: Path,
@@ -1091,6 +1121,7 @@ def _process_one_url(
     settings: Any = None,
     queue_next_row: int | None = None,
     day_session: Any = None,
+    sheet_buffer: Any = None,
 ) -> dict | None:
     try:
         from google_sheets.calendar import today_moscow
@@ -1129,11 +1160,11 @@ def _process_one_url(
         ok = _maybe_append_google_sheet(
             record, base_dir, item_id, {}, url,
             sh=sh, settings=settings, removed=True, queue_next_row=queue_next_row,
-            sheet_today=write_cutoff,
+            sheet_today=write_cutoff, sheet_buffer=sheet_buffer,
         )
         _listing_log_line("брони", "нет на сайте")
         _listing_log_line("цены", "—")
-        _listing_log_line("запись", "ок" if ok else "ошибка")
+        _listing_log_write(sheet_buffer, ok)
         return record
 
     page.wait_for_timeout(int(CARD_INITIAL_SETTLE_S * 1000))
@@ -1171,8 +1202,9 @@ def _process_one_url(
             record, base_dir, item_id, booking_prices, url,
             sh=sh, settings=settings, removed=False, queue_next_row=queue_next_row,
             availability_days=availability_days, sheet_today=write_cutoff,
+            sheet_buffer=sheet_buffer,
         )
-        _listing_log_line("запись", "ок" if ok else "ошибка")
+        _listing_log_write(sheet_buffer, ok)
         return record
 
     title = _extract_title(page) or f"house_{item_id}"
@@ -1258,8 +1290,9 @@ def _process_one_url(
         record, base_dir, item_id, booking_prices, url,
         sh=sh, settings=settings, removed=False, queue_next_row=queue_next_row,
         availability_days=availability_days, sheet_today=write_cutoff,
+        sheet_buffer=sheet_buffer,
     )
-    _listing_log_line("запись", "ок" if ok else "ошибка")
+    _listing_log_write(sheet_buffer, ok)
     return record
 
 
@@ -1294,6 +1327,26 @@ def main() -> None:
     except ImportError:
         day_session = None
 
+    sheet_buffer = None
+    if sh is not None and settings is not None:
+        try:
+            from google_sheets.batch_sync import SheetSyncBuffer
+
+            batch_size = max(1, int(getattr(settings, "sheet_sync_batch_size", 10) or 10))
+            pause_s = max(0.0, float(getattr(settings, "sheet_sync_pause_s", 8.0) or 0.0))
+            sheet_buffer = SheetSyncBuffer(
+                sh,
+                settings,
+                batch_size=batch_size,
+                pause_s=pause_s,
+            )
+            print(
+                f"Запись в таблицу: пакетами по {batch_size}, "
+                f"пауза перед записью {pause_s:.0f} с."
+            )
+        except ImportError:
+            sheet_buffer = None
+
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context, page = _new_page(browser)
@@ -1303,6 +1356,8 @@ def main() -> None:
                 sheet_row = index_to_row(start_index + batch_pos - 1)
                 next_row = sheet_row + 1
                 if parsed_in_session >= restart_every:
+                    if sheet_buffer is not None and len(sheet_buffer) > 0:
+                        sheet_buffer.flush(force=True)
                     print(f"Перезапуск браузера после {restart_every} объявлений…")
                     try:
                         context.close()
@@ -1327,6 +1382,7 @@ def main() -> None:
                         settings=settings,
                         queue_next_row=next_row,
                         day_session=day_session,
+                        sheet_buffer=sheet_buffer,
                     )
                 except Exception as exc:
                     _listing_log_start(sheet_row, last_row)
@@ -1339,6 +1395,9 @@ def main() -> None:
 
                 parsed_in_session += 1
                 processed_ok += 1
+
+            if sheet_buffer is not None and len(sheet_buffer) > 0:
+                sheet_buffer.flush(force=True)
 
             print("Обработка завершена.")
             if sh is not None and settings is not None and full_queue_len > 0:
