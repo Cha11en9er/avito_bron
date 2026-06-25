@@ -40,11 +40,17 @@ FINAL_SCROLL_MAX_S = 1.2
 BOOKING_LOADER_CLICKS = 4
 BOOKING_CLICK_PAUSE_MS_MIN = 450
 BOOKING_CLICK_PAUSE_MS_MAX = 1100
-# Фазы карточки: загрузка 4 с; календарь/цены — ждём данные, но не дольше лимита
-CARD_INITIAL_SETTLE_S = 4.0
-CARD_CALENDAR_PHASE_S = 4.5
-CARD_STEP_GAP_S = 1.0
-CARD_PRICE_PHASE_S = 3.5
+# Фазы карточки (~22 с пауз) + добивка до LISTING_PACE_* с на объявление
+CARD_INITIAL_SETTLE_S = 5.0
+CARD_CALENDAR_PHASE_S = 7.5
+CARD_STEP_GAP_S = 2.5
+CARD_PRICE_PHASE_S = 7.0
+LISTING_PACE_MIN_S = 20.0
+LISTING_PACE_MAX_S = 25.0
+BETWEEN_LISTINGS_MIN_S = 2.0
+BETWEEN_LISTINGS_MAX_S = 4.0
+CAPTCHA_TAIL_LINKS = 5
+CAPTCHA_PROGRESS_BACK_ROWS = 5
 SPA_READY_MAX_S = 20.0
 DATEPICKER_READY_TIMEOUT_MS = 3500
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
@@ -175,6 +181,18 @@ def _card_step_pause(page) -> None:
     page.wait_for_timeout(int(CARD_STEP_GAP_S * 1000))
 
 
+def _ensure_listing_pace(page, started_at: float) -> None:
+    """Не уходим со страницы раньше 20–25 с — снижает риск капчи."""
+    target = random.uniform(LISTING_PACE_MIN_S, LISTING_PACE_MAX_S)
+    remaining = target - (time.monotonic() - started_at)
+    if remaining > 0.05:
+        page.wait_for_timeout(int(remaining * 1000))
+
+
+def _pause_between_listings() -> None:
+    time.sleep(random.uniform(BETWEEN_LISTINGS_MIN_S, BETWEEN_LISTINGS_MAX_S))
+
+
 def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> None:
     wait_ms = int(random.uniform(min_seconds, max_seconds) * 1000)
     page.wait_for_timeout(wait_ms)
@@ -258,6 +276,14 @@ def _listing_log_start(sheet_row: int, last_row: int) -> None:
 
 def _listing_log_line(label: str, status: str) -> None:
     print(f"  {label}: {status}")
+
+
+def _captcha_hit(url: str) -> dict:
+    return {"_captcha": True, "ссылка": url}
+
+
+def _is_captcha_record(record: dict | None) -> bool:
+    return isinstance(record, dict) and bool(record.get("_captcha"))
 
 
 def _wait_for_item_spa_ready(page) -> str:
@@ -1196,12 +1222,13 @@ def _process_one_url(
         return {"ссылка": url, "номер": item_id}
 
     _listing_log_start(sheet_row, last_row)
+    listing_started = time.monotonic()
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
     spa = _wait_for_item_spa_ready(page)
 
     if spa == "blocked":
         _listing_log_line("страница", "капча/блок")
-        return None
+        return _captcha_hit(url)
 
     title_early = _extract_title(page) or f"house_{item_id}"
     if spa == "removed" or is_listing_removed(title_early):
@@ -1224,7 +1251,7 @@ def _process_one_url(
 
     if _page_looks_blocked(page):
         _listing_log_line("страница", "капча/блок")
-        return None
+        return _captcha_hit(url)
 
     availability_days = _parse_listing_calendar(page, url, sheet_row, item_id, day_at_start)
     _card_step_pause(page)
@@ -1262,6 +1289,7 @@ def _process_one_url(
             sheet_worker=sheet_worker,
         )
         _listing_log_write(sheet_worker, ok)
+        _ensure_listing_pace(page, listing_started)
         return record
 
     title = _extract_title(page) or f"house_{item_id}"
@@ -1350,10 +1378,8 @@ def _process_one_url(
         sheet_worker=sheet_worker,
     )
     _listing_log_write(sheet_worker, ok)
+    _ensure_listing_pace(page, listing_started)
     return record
-
-
-def main() -> None:
     _setup_playwright_env()
 
     base_dir = project_root()
@@ -1363,7 +1389,7 @@ def main() -> None:
         print("Нечего парсить.")
         return
 
-    from google_sheets.link_index import index_to_row, last_data_row
+    from google_sheets.link_index import FIRST_DATA_ROW, index_to_row, last_data_row
 
     restart_every = settings.browser_restart_every if settings else BROWSER_RESTART_EVERY
     last_row = last_data_row(full_queue_len)
@@ -1388,10 +1414,13 @@ def main() -> None:
     if sh is not None and settings is not None:
         try:
             from google_sheets.async_sync import AsyncSheetSyncWorker
+            from google_sheets.settings import warm_settings_row_cache
+
+            warm_settings_row_cache(sh, settings)
 
             interval = max(
-                0.0,
-                float(getattr(settings, "sheet_sync_min_interval_s", 1.0) or 1.0),
+                2.0,
+                float(getattr(settings, "sheet_sync_min_interval_s", 3.5) or 3.5),
             )
             sheet_worker = AsyncSheetSyncWorker(
                 sh,
@@ -1410,12 +1439,16 @@ def main() -> None:
         browser = _launch_browser(p)
         context, page = _new_page(browser)
         parsed_in_session = 0
+        captcha_tail_left: int | None = None
+        captcha_first_row: int | None = None
+        stop_for_captcha = False
         try:
             for batch_pos, url in enumerate(urls, start=1):
                 sheet_row = index_to_row(start_index + batch_pos - 1)
                 next_row = sheet_row + 1
                 if parsed_in_session >= restart_every:
-                    if sheet_worker is not None:
+                    if sheet_worker is not None and sheet_worker.pending > 0:
+                        print("Ожидание фоновой записи перед перезапуском браузера…")
                         sheet_worker.drain()
                     print(f"Перезапуск браузера после {restart_every} объявлений…")
                     try:
@@ -1449,32 +1482,78 @@ def main() -> None:
                     traceback.print_exc()
                     record = None
 
-                if record is None:
+                if _is_captcha_record(record):
+                    if captcha_tail_left is None:
+                        captcha_first_row = sheet_row
+                        captcha_tail_left = CAPTCHA_TAIL_LINKS
+                        print(
+                            f"Капча на строке {sheet_row}: "
+                            f"ещё {CAPTCHA_TAIL_LINKS} ссылок, затем остановка."
+                        )
+                    captcha_tail_left -= 1
+                elif captcha_tail_left is not None:
+                    captcha_tail_left -= 1
+
+                if captcha_tail_left is not None and captcha_tail_left <= 0:
+                    stop_for_captcha = True
+                    resume_row = max(
+                        FIRST_DATA_ROW,
+                        (captcha_first_row or sheet_row) - CAPTCHA_PROGRESS_BACK_ROWS,
+                    )
+                    print(
+                        f"Капча: стоп. Следующий запуск — со строки {resume_row} "
+                        f"(−{CAPTCHA_PROGRESS_BACK_ROWS} от строки {captcha_first_row})."
+                    )
+                    if sheet_worker is not None:
+                        print("Ожидание фоновой записи перед остановкой…")
+                        sheet_worker.drain()
+                    if sh is not None and settings is not None:
+                        try:
+                            from google_sheets.iterations import save_iteration_progress
+
+                            save_iteration_progress(
+                                sh,
+                                settings,
+                                resume_row,
+                                total_urls=full_queue_len,
+                            )
+                        except ImportError:
+                            pass
+                    break
+
+                if _is_captcha_record(record) or record is None:
                     continue
 
                 parsed_in_session += 1
                 processed_ok += 1
+                _pause_between_listings()
 
+            synced_next_row: int | None = None
             if sheet_worker is not None:
-                sheet_worker.drain()
+                synced_next_row = sheet_worker.finalize_sync()
 
-            print("Обработка завершена.")
-            if sh is not None and settings is not None and full_queue_len > 0:
-                try:
-                    from google_sheets import finish_parse_session
+            if stop_for_captcha:
+                print("Парсер остановлен из‑за капчи. Решите блокировку и перезапустите.")
+            else:
+                print("Обработка завершена.")
+                if sh is not None and settings is not None and full_queue_len > 0:
+                    try:
+                        from google_sheets import finish_parse_session
 
-                    finish_parse_session(
-                        sh,
-                        settings,
-                        full_queue_len=full_queue_len,
-                        final_progress=index_to_row(start_index + processed_ok),
-                    )
-                except ImportError:
-                    pass
+                        final_progress = synced_next_row or index_to_row(
+                            start_index + processed_ok
+                        )
+                        finish_parse_session(
+                            sh,
+                            settings,
+                            full_queue_len=full_queue_len,
+                            final_progress=final_progress,
+                        )
+                    except ImportError:
+                        pass
         finally:
             if sheet_worker is not None:
                 try:
-                    sheet_worker.drain()
                     sheet_worker.shutdown()
                 except Exception:
                     pass
@@ -1492,6 +1571,9 @@ if __name__ == "__main__":
     _console_utf8()
     try:
         main()
+    except KeyboardInterrupt:
+        print("\nОстановлено пользователем (Ctrl+C).")
+        sys.exit(130)
     except Exception:
         print("Произошла ошибка:")
         traceback.print_exc()

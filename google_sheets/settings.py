@@ -25,7 +25,7 @@ class ParserSettings:
     detail_range_from: int = 0
     detail_range_to: int = 0
     browser_restart_every: int = 10
-    sheet_sync_min_interval_s: float = 1.0
+    sheet_sync_min_interval_s: float = 3.5
     # --- детальный парсер ---
     run_detail: bool = False
     detail_fill_mode: str = "append"
@@ -87,8 +87,8 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
     ),
     (
         "sheet_sync_min_interval_s",
-        "1",
-        "Минимальная пауза (сек.) между записями в Google Таблицу в фоновом потоке — снижает лимит read requests per minute.",
+        "3.5",
+        "Минимальная пауза (сек.) между запросами к Google Sheets API в фоновом потоке (лимит read requests/min).",
     ),
     (
         "run_detail",
@@ -389,11 +389,7 @@ def save_settings_values(sh: Any, settings: ParserSettings, updates: dict[str, s
     from gspread.utils import rowcol_to_a1
 
     ws = ensure_worksheet(sh, settings.sheet_settings, rows=100, cols=4)
-    rows = ws.get_all_values()
-    key_to_row: dict[str, int] = {}
-    for i, row in enumerate(rows[1:], start=2):
-        if row and (row[0] or "").strip():
-            key_to_row[(row[0] or "").strip()] = i
+    key_to_row = _settings_key_row_map(ws)
 
     body: list[dict] = []
     for key, val in updates.items():
@@ -409,6 +405,38 @@ def save_settings_values(sh: Any, settings: ParserSettings, updates: dict[str, s
         ws.batch_update(body, value_input_option="USER_ENTERED")
 
     api_retry(_do)
+
+
+_settings_key_cache: dict[str, int] | None = None
+
+
+def warm_settings_row_cache(sh: Any, settings: ParserSettings) -> None:
+    """Один раз за прогон: карта ключ → строка на листе «настройки» (без read на каждую запись)."""
+    global _settings_key_cache
+    ws = ensure_worksheet(sh, settings.sheet_settings, rows=100, cols=4)
+    _settings_key_cache = _settings_key_row_map(ws)
+
+
+def clear_settings_row_cache() -> None:
+    global _settings_key_cache
+    _settings_key_cache = None
+
+
+def _settings_key_row_map(ws: Any) -> dict[str, int]:
+    global _settings_key_cache
+    if _settings_key_cache is not None:
+        return _settings_key_cache
+
+    def _read() -> list[list[str]]:
+        return ws.get_all_values()
+
+    rows = api_retry(_read)
+    key_to_row: dict[str, int] = {}
+    for i, row in enumerate(rows[1:], start=2):
+        if row and (row[0] or "").strip():
+            key_to_row[(row[0] or "").strip()] = i
+    _settings_key_cache = key_to_row
+    return key_to_row
 
 
 def seed_settings_workbook(base_dir: Path, *, force: bool = False) -> None:

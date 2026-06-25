@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 
 
@@ -16,3 +16,4 @@ class PendingListingSync:
     queue_next_row: int | None = None
     availability_days: dict[date, str] | None = None
     sheet_today: date | None = None
+    attempts: int = 0

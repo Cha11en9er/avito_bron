@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 SCOPES = ("https://www.googleapis.com/auth/spreadsheets",)
+
+_api_lock = threading.Lock()
+_last_api_at = 0.0
+_api_min_interval_s = 2.5
+
+
+def set_api_min_interval(seconds: float) -> None:
+    global _api_min_interval_s
+    _api_min_interval_s = max(0.0, float(seconds))
+
+
+def _api_throttle() -> None:
+    global _last_api_at
+    with _api_lock:
+        now = time.monotonic()
+        wait = _api_min_interval_s - (now - _last_api_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_api_at = time.monotonic()
+
+
+def is_sheets_quota_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    if "read requests" in msg or "quota exceeded" in msg or "rate limit" in msg:
+        return True
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code == 429
 
 
 def load_dotenv(base_dir: Path) -> None:
@@ -55,19 +83,17 @@ def open_spreadsheet(base_dir: Path, *, sheet_id: str = "") -> Any:
     return gc.open_by_key(sid)
 
 
-def api_retry(fn: Callable[[], Any], waits: tuple[float, ...] = (2.0, 5.0, 12.0, 30.0)) -> Any:
+def api_retry(fn: Callable[[], Any], waits: tuple[float, ...] = (5.0, 15.0, 45.0, 90.0)) -> Any:
     from gspread.exceptions import APIError
 
     last: Exception | None = None
     for attempt in range(len(waits) + 1):
+        _api_throttle()
         try:
             return fn()
         except APIError as exc:
             last = exc
-            code = getattr(getattr(exc, "response", None), "status_code", None)
-            msg = str(exc).lower()
-            quota = code == 429 or "rate limit" in msg or "read requests" in msg
-            if quota and attempt < len(waits):
+            if is_sheets_quota_error(exc) and attempt < len(waits):
                 time.sleep(waits[attempt])
                 continue
             raise

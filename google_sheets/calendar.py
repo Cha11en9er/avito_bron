@@ -346,7 +346,11 @@ def _read_row_values_by_date(
     ws: Any, row: int, col_by_date: dict[date, int]
 ) -> dict[date, str]:
     """Текущие значения ячеек строки по датам (из заголовка)."""
-    row_vals = ws.row_values(row)
+
+    def _read() -> list[str]:
+        return ws.row_values(row)
+
+    row_vals = api_retry(_read)
     out: dict[date, str] = {}
     for d, col in col_by_date.items():
         idx = col - 1

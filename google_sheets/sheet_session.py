@@ -17,6 +17,7 @@ from google_sheets.calendar import (
     open_calendar_ws,
     today_moscow,
 )
+from google_sheets.iterations import ensure_logs_sheet
 from google_sheets.settings import ParserSettings
 
 
@@ -61,12 +62,19 @@ class CalendarWsCache:
     @classmethod
     def load(cls, sh: Any, settings: ParserSettings, *, availability: bool) -> CalendarWsCache:
         ws = open_calendar_ws(sh, settings, availability=availability)
-        headers = _trim_trailing_empty_headers(ws.row_values(1) or ["Объявление"])
+
+        def _headers() -> list[str]:
+            return ws.row_values(1) or ["Объявление"]
+
+        def _col_a() -> list[str]:
+            return ws.col_values(1)
+
+        headers = _trim_trailing_empty_headers(api_retry(_headers))
         if not headers or not headers[0].strip():
             headers = ["Объявление"]
         today = today_moscow()
         col_by = build_header_date_map(headers, today, settings.calendar_start_year)
-        url_index = UrlRowIndex.from_col_a(ws.col_values(1))
+        url_index = UrlRowIndex.from_col_a(api_retry(_col_a))
         return cls(ws=ws, settings=settings, headers=headers, col_by=col_by, url_index=url_index)
 
     def ensure_dates(self, needed_dates: set[date], today: date) -> dict[date, int]:
@@ -120,15 +128,19 @@ def init_parse_sheet_context(
     settings: ParserSettings,
     *,
     log_urls: list[str] | None = None,
+    skip_logs_ensure: bool = False,
 ) -> ParseSheetContext:
     urls = log_urls or []
-    ensure_logs_sheet(sh, settings, urls)
+    if not skip_logs_ensure:
+        ensure_logs_sheet(sh, settings, urls)
     logs_ws = ensure_worksheet(sh, settings.sheet_logs, rows=3000, cols=20)
+    availability = CalendarWsCache.load(sh, settings, availability=True)
+    prices = CalendarWsCache.load(sh, settings, availability=False)
     ctx = ParseSheetContext(
-        availability=CalendarWsCache.load(sh, settings, availability=True),
-        prices=CalendarWsCache.load(sh, settings, availability=False),
+        availability=availability,
+        prices=prices,
         logs_ws=logs_ws,
-        logs_index=UrlRowIndex.from_col_a(logs_ws.col_values(1)),
+        logs_index=UrlRowIndex.from_col_a(api_retry(lambda: logs_ws.col_values(1))),
         settings=settings,
     )
     _tls.ctx = ctx
