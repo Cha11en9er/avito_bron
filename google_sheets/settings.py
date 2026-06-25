@@ -25,8 +25,7 @@ class ParserSettings:
     detail_range_from: int = 0
     detail_range_to: int = 0
     browser_restart_every: int = 10
-    sheet_sync_batch_size: int = 10
-    sheet_sync_pause_s: float = 8.0
+    sheet_sync_min_interval_s: float = 1.0
     # --- детальный парсер ---
     run_detail: bool = False
     detail_fill_mode: str = "append"
@@ -87,14 +86,9 @@ SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
         "После скольких успешно обработанных объявлений перезапустить браузер (снижает сбои и утечки памяти).",
     ),
     (
-        "sheet_sync_batch_size",
-        "10",
-        "Запись в Google Таблицу пакетами: столько ссылок парсим подряд (только Avito), затем одна пауза и запись в листы.",
-    ),
-    (
-        "sheet_sync_pause_s",
-        "8",
-        "Пауза (сек.) перед пакетной записью в таблицу — перерыв для Avito, пока идут запросы к Google Sheets.",
+        "sheet_sync_min_interval_s",
+        "1",
+        "Минимальная пауза (сек.) между записями в Google Таблицу в фоновом потоке — снижает лимит read requests per minute.",
     ),
     (
         "run_detail",
@@ -243,7 +237,6 @@ def _coerce_value(name: str, raw: str) -> Any:
         "detail_range_from",
         "detail_range_to",
         "browser_restart_every",
-        "sheet_sync_batch_size",
         "parse_iteration",
         "iteration_progress",
         "iteration_progress_for",
@@ -263,7 +256,7 @@ def _coerce_value(name: str, raw: str) -> Any:
             return int(s)
         except ValueError:
             return 2026
-    if name == "sheet_sync_pause_s":
+    if name == "sheet_sync_min_interval_s":
         try:
             return float(s.replace(",", "."))
         except ValueError:

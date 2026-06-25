@@ -240,13 +240,19 @@ def write_log_entry(
     ok: bool = True,
 ) -> None:
     from gspread.utils import rowcol_to_a1
+    from google_sheets.sheet_session import get_parse_sheet_context
 
-    ws = ensure_worksheet(sh, settings.sheet_logs, rows=3000, cols=20)
-    ensure_logs_sheet(sh, settings, [listing_url])
+    ctx = get_parse_sheet_context()
+    if ctx is not None:
+        ws = ctx.logs_ws
+        row = ctx.logs_index.find_row(listing_url)
+    else:
+        ws = ensure_worksheet(sh, settings.sheet_logs, rows=3000, cols=20)
+        ensure_logs_sheet(sh, settings, [listing_url])
+        row = find_row_by_url_col_a(ws, listing_url)
 
     it = max(1, settings.parse_iteration)
     col_date, col_time, col_status = _slot_columns(settings, it)
-    row = find_row_by_url_col_a(ws, listing_url)
     now = datetime.now(tz_moscow())
     date_str = now.strftime("%d.%m.%Y")
     time_str = now.strftime("%H:%M:%S")

@@ -55,7 +55,7 @@ def open_spreadsheet(base_dir: Path, *, sheet_id: str = "") -> Any:
     return gc.open_by_key(sid)
 
 
-def api_retry(fn: Callable[[], Any], waits: tuple[float, ...] = (1.5, 3.0, 8.0, 16.0)) -> Any:
+def api_retry(fn: Callable[[], Any], waits: tuple[float, ...] = (2.0, 5.0, 12.0, 30.0)) -> Any:
     from gspread.exceptions import APIError
 
     last: Exception | None = None
@@ -65,7 +65,9 @@ def api_retry(fn: Callable[[], Any], waits: tuple[float, ...] = (1.5, 3.0, 8.0, 
         except APIError as exc:
             last = exc
             code = getattr(getattr(exc, "response", None), "status_code", None)
-            if code == 429 and attempt < len(waits):
+            msg = str(exc).lower()
+            quota = code == 429 or "rate limit" in msg or "read requests" in msg
+            if quota and attempt < len(waits):
                 time.sleep(waits[attempt])
                 continue
             raise

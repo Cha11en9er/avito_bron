@@ -402,6 +402,94 @@ def _batch_updates_for_row(
     return body
 
 
+def _update_availability_cached(
+    cache: Any,
+    listing_url: str,
+    day_map: dict[date, str],
+    today: date,
+) -> tuple[int, str]:
+    ws = cache.ws
+    headers = cache.headers
+    if not day_map:
+        return 0, "нет дней в календаре"
+
+    col_by = cache.ensure_dates(set(day_map.keys()), today)
+    row = cache.find_row(listing_url)
+    _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
+
+    existing_by_date = _read_row_values_by_date(ws, row, col_by)
+    values = _extend_live_day_map_after_not_found(day_map, col_by, existing_by_date, today)
+
+    updates = _batch_updates_for_row(
+        row, col_by, values, today, existing_by_date=existing_by_date
+    )
+    if not updates:
+        return 0, "нечего писать"
+
+    def _do_batch() -> None:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+    api_retry(_do_batch)
+    return len(updates), "ок"
+
+
+def _update_calendar_sheet_cached(
+    cache: Any,
+    listing_url: str,
+    booking: dict[str, str],
+    today: date,
+    mode: str,
+    *,
+    listing_removed: bool = False,
+) -> tuple[int, str]:
+    availability = mode == "availability"
+    ws = cache.ws
+    headers = cache.headers
+    slots = collect_booking_slots(booking, today)
+
+    if listing_removed:
+        needed_removed = removed_listing_dates(today)
+        col_by = cache.ensure_dates(needed_removed, today)
+        if not col_by:
+            return 0, "нет столбцов дат"
+        day_map = {d: NOT_FOUND_ON_SITE for d in needed_removed if d in col_by}
+    elif not slots:
+        return 0, "нет слотов брони"
+    else:
+        av_map, pr_map = build_day_updates_from_slots(slots, today)
+        day_map = av_map if availability else pr_map
+        if not day_map:
+            return 0, "нечего писать"
+        needed = dates_from_slots(slots, today)
+        col_by = cache.ensure_dates(needed, today)
+
+    row = cache.find_row(listing_url)
+    _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
+
+    existing_by_date = _read_row_values_by_date(ws, row, col_by)
+    if not listing_removed:
+        day_map = _extend_live_day_map_after_not_found(
+            day_map, col_by, existing_by_date, today
+        )
+
+    updates = _batch_updates_for_row(
+        row,
+        col_by,
+        day_map,
+        today,
+        allow_past=listing_removed,
+        existing_by_date=existing_by_date,
+    )
+    if not updates:
+        return 0, "нечего писать"
+
+    def _do_batch() -> None:
+        ws.batch_update(updates, value_input_option="USER_ENTERED")
+
+    api_retry(_do_batch)
+    return len(updates), "ок"
+
+
 def update_availability_day_map(
     sh: Any,
     settings: ParserSettings,
@@ -414,6 +502,12 @@ def update_availability_day_map(
     Обновляются только столбцы с датой >= today: прошлые дни в листе не перезаписываются
     (в календаре на сайте они выглядят «занято», но это не снимает старые 0 в таблице).
     """
+    from google_sheets.sheet_session import get_parse_sheet_context
+
+    ctx = get_parse_sheet_context()
+    if ctx is not None:
+        return _update_availability_cached(ctx.availability, listing_url, day_map, today)
+
     ws = open_calendar_ws(sh, settings, availability=True)
     rows = ws.get_all_values()
     if not rows:
@@ -455,6 +549,20 @@ def update_calendar_sheet(
     listing_removed: bool = False,
 ) -> tuple[int, str]:
     availability = mode == "availability"
+    from google_sheets.sheet_session import get_parse_sheet_context
+
+    ctx = get_parse_sheet_context()
+    if ctx is not None:
+        cache = ctx.availability if availability else ctx.prices
+        return _update_calendar_sheet_cached(
+            cache,
+            listing_url,
+            booking,
+            today,
+            mode,
+            listing_removed=listing_removed,
+        )
+
     ws = open_calendar_ws(sh, settings, availability=availability)
     rows = ws.get_all_values()
     if not rows:
