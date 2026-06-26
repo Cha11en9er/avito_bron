@@ -37,22 +37,25 @@ BOOKING_PHASE_MIN_S = 7.0
 BOOKING_PHASE_MAX_S = 8.0
 FINAL_SCROLL_MIN_S = 0.8
 FINAL_SCROLL_MAX_S = 1.2
-BOOKING_LOADER_CLICKS = 4
-BOOKING_CLICK_PAUSE_MS_MIN = 450
-BOOKING_CLICK_PAUSE_MS_MAX = 1100
-# Фазы карточки (~22 с пауз) + добивка до LISTING_PACE_* с на объявление
-CARD_INITIAL_SETTLE_S = 5.0
-CARD_CALENDAR_PHASE_S = 7.5
-CARD_STEP_GAP_S = 2.5
-CARD_PRICE_PHASE_S = 7.0
-LISTING_PACE_MIN_S = 20.0
-LISTING_PACE_MAX_S = 25.0
-BETWEEN_LISTINGS_MIN_S = 2.0
-BETWEEN_LISTINGS_MAX_S = 4.0
-CAPTCHA_TAIL_LINKS = 5
+BOOKING_LOADER_CLICKS = 2
+BOOKING_CLICK_PAUSE_MS_MIN = 150
+BOOKING_CLICK_PAUSE_MS_MAX = 400
+# Фазы карточки (run_detail=0): +1 с на этап относительно быстрого режима.
+CARD_INITIAL_LOAD_MIN_S = 0.0
+CARD_INITIAL_LOAD_MAX_S = 10.0
+CARD_INITIAL_CAPTCHA_GRACE_S = 2.5
+CARD_CALENDAR_PHASE_S = 4.0
+CARD_PRICE_PHASE_S = 3.0
+CARD_SCROLL_MIN_S = 2.0
+CARD_SCROLL_MAX_S = 2.5
+LISTING_PACE_MAX_S = 35.0
+BETWEEN_LISTINGS_MIN_S = 1.5
+BETWEEN_LISTINGS_MAX_S = 2.5
+WARMUP_LISTINGS = 20
+WARMUP_PACE_MULT = 1.0
+CAPTCHA_STREAK_LIMIT = 5
 CAPTCHA_PROGRESS_BACK_ROWS = 5
-SPA_READY_MAX_S = 20.0
-DATEPICKER_READY_TIMEOUT_MS = 3500
+DATEPICKER_READY_TIMEOUT_MS = 2200
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
 BROWSER_RESTART_EVERY = 10
 URLS_FILE_NAME = "urls.txt"
@@ -177,20 +180,71 @@ def _new_page(browser):
     return context, page
 
 
-def _card_step_pause(page) -> None:
-    page.wait_for_timeout(int(CARD_STEP_GAP_S * 1000))
+def _listing_pace_bounds(listing_num: int) -> tuple[float, float]:
+    return 0.0, LISTING_PACE_MAX_S
 
 
-def _ensure_listing_pace(page, started_at: float) -> None:
-    """Не уходим со страницы раньше 20–25 с — снижает риск капчи."""
-    target = random.uniform(LISTING_PACE_MIN_S, LISTING_PACE_MAX_S)
-    remaining = target - (time.monotonic() - started_at)
-    if remaining > 0.05:
-        page.wait_for_timeout(int(remaining * 1000))
+def _ensure_listing_pace(page, started_at: float, listing_num: int) -> float:
+    """Не добавляем искусственных пауз — только логируем, если карточка > LISTING_PACE_MAX_S."""
+    elapsed = time.monotonic() - started_at
+    over = elapsed - LISTING_PACE_MAX_S
+    if over > 0.3:
+        return 0.0
+    return 0.0
+
+
+class _ListingTimings:
+    """Секунды по этапам одного объявления (monotonic)."""
+
+    __slots__ = ("_root", "_since", "stages")
+
+    def __init__(self, root: float) -> None:
+        self._root = root
+        self._since = root
+        self.stages: dict[str, float] = {}
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self.stages[name] = self.stages.get(name, 0.0) + (now - self._since)
+        self._since = now
+
+    def add(self, name: str, seconds: float) -> None:
+        if seconds > 0.05:
+            self.stages[name] = self.stages.get(name, 0.0) + seconds
+
+    def total(self) -> float:
+        return time.monotonic() - self._root
+
+    def line(self) -> str:
+        order = ("загрузка", "календарь", "цены", "скролл", "детали", "debug", "запись", "прочее")
+        staged = sum(self.stages.values())
+        total = self.total()
+        gap = total - staged
+        if gap > 0.25:
+            self.stages["прочее"] = self.stages.get("прочее", 0.0) + gap
+        parts: list[str] = []
+        for key in order:
+            if key in self.stages:
+                parts.append(f"{key} {self.stages[key]:.1f}с")
+        for key, val in self.stages.items():
+            if key not in order:
+                parts.append(f"{key} {val:.1f}с")
+        parts.append(f"итого {total:.1f}с")
+        return "время: " + ", ".join(parts)
+
+
+def _listing_log_timings(timings: _ListingTimings) -> None:
+    msg = timings.line()
+    if timings.total() > LISTING_PACE_MAX_S + 0.5:
+        msg += f" (лимит {LISTING_PACE_MAX_S:.0f}с)"
+    _listing_log_status(msg)
 
 
 def _pause_between_listings() -> None:
-    time.sleep(random.uniform(BETWEEN_LISTINGS_MIN_S, BETWEEN_LISTINGS_MAX_S))
+    lo, hi = BETWEEN_LISTINGS_MIN_S, BETWEEN_LISTINGS_MAX_S
+    if hi < lo:
+        hi = lo
+    time.sleep(random.uniform(lo, hi))
 
 
 def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> None:
@@ -210,8 +264,53 @@ def _simulate_human_activity(page) -> None:
         pass
 
 
+def _listing_spa_visible(page) -> bool:
+    selectors = (
+        '[data-marker="item-view/item-price"], '
+        'h1[itemprop="name"], '
+        '[data-marker="item-view/title-info"] h1'
+    )
+    try:
+        loc = page.locator(selectors).first
+        return loc.count() > 0 and loc.is_visible(timeout=400)
+    except Exception:
+        return False
+
+
+def _card_scroll_phase(page) -> None:
+    _scroll_for_duration(page, CARD_SCROLL_MIN_S, CARD_SCROLL_MAX_S)
+
+
+def _initial_load_bounds() -> tuple[float, float]:
+    return CARD_INITIAL_LOAD_MIN_S, CARD_INITIAL_LOAD_MAX_S
+
+
+def _wait_initial_page_content(page) -> str:
+    """До max с ждём карточку; если SPA уже видна — сразу ready. Капчу не раньше grace."""
+    _, max_s = _initial_load_bounds()
+    started = time.monotonic()
+    while time.monotonic() - started < max_s:
+        if _listing_spa_visible(page):
+            return "ready"
+        if _page_looks_removed(page):
+            return "removed"
+        if time.monotonic() - started >= CARD_INITIAL_CAPTCHA_GRACE_S and _page_looks_blocked(page):
+            return "blocked"
+        page.wait_for_timeout(400)
+
+    if _listing_spa_visible(page):
+        return "ready"
+    if _page_looks_removed(page):
+        return "removed"
+    if _page_looks_blocked(page):
+        return "blocked"
+    return "timeout"
+
+
 def _page_looks_blocked(page) -> bool:
-    """Капча, firewall или ограничение доступа — не ждём бесконечно."""
+    """Капча / firewall — только если карточка объявления ещё не видна."""
+    if _listing_spa_visible(page):
+        return False
     try:
         url = (page.url or "").lower()
         if any(x in url for x in ("captcha", "firewall", "accessdenied", "blocked")):
@@ -246,7 +345,9 @@ def _page_looks_blocked(page) -> bool:
 
 
 def _page_looks_removed(page) -> bool:
-    """Быстрая проверка снятого объявления — не ждём 65 с пустого SPA."""
+    """Снятое/закрытое объявление — не путать с капчей (у капчи нет «не посмотреть»)."""
+    if _page_looks_blocked(page):
+        return False
     try:
         title_loc = page.locator(
             'h1[itemprop="name"], [data-marker="item-view/title-info"] h1'
@@ -274,8 +375,8 @@ def _listing_log_start(sheet_row: int, last_row: int) -> None:
     print(f"{ts}  {sheet_row}/{last_row}")
 
 
-def _listing_log_line(label: str, status: str) -> None:
-    print(f"  {label}: {status}")
+def _listing_log_status(status: str) -> None:
+    print(f"  {status}")
 
 
 def _captcha_hit(url: str) -> dict:
@@ -284,34 +385,6 @@ def _captcha_hit(url: str) -> dict:
 
 def _is_captcha_record(record: dict | None) -> bool:
     return isinstance(record, dict) and bool(record.get("_captcha"))
-
-
-def _wait_for_item_spa_ready(page) -> str:
-    """Ждём карточку объявления. ready | removed | blocked | timeout."""
-    selectors = (
-        '[data-marker="item-view/item-price"], '
-        'h1[itemprop="name"], '
-        '[data-marker="item-view/title-info"] h1, '
-        '[data-marker="nearest-dates"]'
-    )
-    loc = page.locator(selectors).first
-    deadline = time.monotonic() + SPA_READY_MAX_S
-    while time.monotonic() < deadline:
-        if _page_looks_blocked(page):
-            return "blocked"
-        if _page_looks_removed(page):
-            return "removed"
-        try:
-            if loc.is_visible(timeout=500):
-                return "ready"
-        except Exception:
-            pass
-        page.wait_for_timeout(200)
-    if _page_looks_blocked(page):
-        return "blocked"
-    if _page_looks_removed(page):
-        return "removed"
-    return "timeout"
 
 
 def _scroll_through_page(page, total_scrolls: int = 6) -> None:
@@ -509,16 +582,9 @@ def _click_nearest_dates_loader(page) -> bool:
 def _collect_booking_prices_with_loaders(page, phase_deadline: float) -> dict[str, tuple[str, str]]:
     """
     Карусель «ближайшие даты»: читаем цены, до BOOKING_LOADER_CLICKS раз жмём плейсхолдер.
-    Если слоты уже есть — не крутим до конца фазы.
+    Между действиями — короткие паузы; фазовый бюджет — phase_deadline (как в 1c28f1b).
     """
     acc = _read_booking_slots(page)
-    if acc:
-        if time.monotonic() < phase_deadline - 0.4 and _click_nearest_dates_loader(page):
-            pause_ms = random.randint(BOOKING_CLICK_PAUSE_MS_MIN, BOOKING_CLICK_PAUSE_MS_MAX)
-            page.wait_for_timeout(min(pause_ms, 900))
-            acc = _merge_booking_dicts(acc, _read_booking_slots(page))
-        return acc
-
     for _ in range(BOOKING_LOADER_CLICKS):
         if time.monotonic() >= phase_deadline - 0.15:
             break
@@ -529,17 +595,20 @@ def _collect_booking_prices_with_loaders(page, phase_deadline: float) -> dict[st
                 break
             _micro_scroll_nudge(page)
         if not _click_nearest_dates_loader(page):
-            if acc:
-                break
-            continue
+            break
         remaining_ms = int((phase_deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            break
         pause_ms = random.randint(BOOKING_CLICK_PAUSE_MS_MIN, BOOKING_CLICK_PAUSE_MS_MAX)
-        if remaining_ms > 0:
-            pause_ms = min(pause_ms, max(120, remaining_ms - 80))
+        pause_ms = min(pause_ms, max(80, remaining_ms - 40))
         page.wait_for_timeout(pause_ms)
         acc = _merge_booking_dicts(acc, _read_booking_slots(page))
-        if acc:
+    while time.monotonic() < phase_deadline:
+        _micro_scroll_nudge(page)
+        left_ms = int((phase_deadline - time.monotonic()) * 1000)
+        if left_ms <= 0:
             break
+        page.wait_for_timeout(min(80, left_ms))
     return acc
 
 
@@ -1010,16 +1079,19 @@ def _or_not_found(value: str | None) -> str:
 
 
 def _collect_nearest_date_prices(page) -> dict[str, str]:
-    """Цены из карусели «ближайшие даты» (фаза CARD_PRICE_PHASE_S сек.)."""
+    """Цены из карусели «ближайшие даты» (бюджет CARD_PRICE_PHASE_S, scroll внутри бюджета)."""
     booking_map: dict[str, tuple[str, str]] = {}
     phase_end = time.monotonic() + CARD_PRICE_PHASE_S
     try:
         nd = page.locator('[data-marker="nearest-dates"]')
         if nd.count() > 0:
-            nd.first.scroll_into_view_if_needed(timeout=5000)
-            booking_map = _collect_booking_prices_with_loaders(page, phase_end)
-    except Exception as exc:
-        print(f"  Карусель цен: {exc}")
+            left_ms = int((phase_end - time.monotonic()) * 1000)
+            if left_ms > 0:
+                nd.first.scroll_into_view_if_needed(timeout=min(1500, left_ms))
+            if time.monotonic() < phase_end:
+                booking_map = _collect_booking_prices_with_loaders(page, phase_end)
+    except Exception:
+        pass
     return _booking_prices_to_dict(booking_map)
 
 
@@ -1029,6 +1101,9 @@ def _parse_listing_calendar(
     sheet_row: int,
     item_id: str | int,
     today: date,
+    *,
+    base_dir: Path | None = None,
+    settings: Any = None,
 ) -> dict[date, str]:
     """
     Сдаваемость из datepicker (2 месяца, без листания).
@@ -1045,7 +1120,7 @@ def _parse_listing_calendar(
     availability_days: dict[date, str] = {}
     calendar_trigger: str | None = None
     sid = str(item_id)
-    cal_deadline = time.monotonic() + CARD_CALENDAR_PHASE_S
+    cal_phase_end = time.monotonic() + CARD_CALENDAR_PHASE_S
 
     scroll_to_calendar(page)
 
@@ -1055,7 +1130,7 @@ def _parse_listing_calendar(
             page,
             sheet_row,
             sid,
-            after_open_wait_s=1.0,
+            after_open_wait_s=0.3,
             ready_timeout_ms=DATEPICKER_READY_TIMEOUT_MS,
             quiet=True,
         )
@@ -1064,17 +1139,32 @@ def _parse_listing_calendar(
         if not calendar_trigger:
             return
         try:
-            availability_days, _, _ = read_availability_panels(page, today)
+            debug_dir: Path | None = None
+            incomplete_debug_dir: Path | None = None
+            if base_dir is not None:
+                rel = (
+                    (getattr(settings, "debug_html_dir", None) or "debug_html").strip()
+                    if settings is not None
+                    else "debug_html"
+                )
+                incomplete_debug_dir = base_dir / rel
+                if settings is not None and getattr(settings, "debug_dump_html", False):
+                    debug_dir = incomplete_debug_dir
+            availability_days, _, _ = read_availability_panels(
+                page,
+                today,
+                debug_dir=debug_dir,
+                incomplete_debug_dir=incomplete_debug_dir,
+                debug_id=sid,
+            )
         except Exception:
             traceback.print_exc()
 
-    while time.monotonic() < cal_deadline:
-        if _page_looks_blocked(page):
-            break
-        _run_calendar_parse()
-        if availability_days:
-            break
-        page.wait_for_timeout(350)
+    _run_calendar_parse()
+
+    remaining = cal_phase_end - time.monotonic()
+    if remaining > 0:
+        page.wait_for_timeout(int(remaining * 1000))
 
     if not calendar_in_url and calendar_trigger:
         close_calendar_popup(page, calendar_trigger, quiet=True)
@@ -1180,9 +1270,14 @@ def _maybe_append_google_sheet(
 def _listing_log_write(sheet_worker: Any, ok: bool | None = None) -> None:
     if sheet_worker is not None:
         pending = sheet_worker.pending
-        _listing_log_line("запись", f"фон ({pending} в очереди)" if pending else "фон")
+        if pending:
+            _listing_log_status(f"запись: фон ({pending})")
+        else:
+            _listing_log_status("запись: фон")
+    elif ok is False:
+        _listing_log_status("запись: ошибка")
     else:
-        _listing_log_line("запись", "ок" if ok else "ошибка")
+        _listing_log_status("запись: ок")
 
 
 def _process_one_url(
@@ -1197,6 +1292,7 @@ def _process_one_url(
     queue_next_row: int | None = None,
     day_session: Any = None,
     sheet_worker: Any = None,
+    listing_num: int = 1,
 ) -> dict | None:
     try:
         from google_sheets.calendar import today_moscow
@@ -1218,16 +1314,34 @@ def _process_one_url(
         and day_session.should_skip_repeat(url)
     ):
         _listing_log_start(sheet_row, last_row)
-        _listing_log_line("пропуск", "уже до смены дня")
+        _listing_log_status("пропуск")
         return {"ссылка": url, "номер": item_id}
 
     _listing_log_start(sheet_row, last_row)
     listing_started = time.monotonic()
+    timings = _ListingTimings(listing_started)
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
-    spa = _wait_for_item_spa_ready(page)
+    spa = _wait_initial_page_content(page)
+    timings.add("загрузка", time.monotonic() - listing_started)
+    timings._since = time.monotonic()
+
+    if spa == "timeout" and _page_looks_blocked(page):
+        spa = "blocked"
 
     if spa == "blocked":
-        _listing_log_line("страница", "капча/блок")
+        page.wait_for_timeout(1000)
+        if _listing_spa_visible(page):
+            spa = "ready"
+        elif _page_looks_blocked(page):
+            _listing_log_status("капча")
+            _listing_log_timings(timings)
+            return _captcha_hit(url)
+        else:
+            spa = "timeout"
+
+    if spa != "ready" and _page_looks_blocked(page):
+        _listing_log_status("капча")
+        _listing_log_timings(timings)
         return _captcha_hit(url)
 
     title_early = _extract_title(page) or f"house_{item_id}"
@@ -1242,34 +1356,33 @@ def _process_one_url(
             sh=sh, settings=settings, removed=True, queue_next_row=queue_next_row,
             sheet_today=write_cutoff, sheet_worker=sheet_worker,
         )
-        _listing_log_line("брони", "нет на сайте")
-        _listing_log_line("цены", "—")
+        _listing_log_status("нет на сайте")
         _listing_log_write(sheet_worker, ok)
+        _listing_log_timings(timings)
         return record
 
-    page.wait_for_timeout(int(CARD_INITIAL_SETTLE_S * 1000))
-
-    if _page_looks_blocked(page):
-        _listing_log_line("страница", "капча/блок")
-        return _captcha_hit(url)
-
-    availability_days = _parse_listing_calendar(page, url, sheet_row, item_id, day_at_start)
-    _card_step_pause(page)
-
-    booking_prices = _collect_nearest_date_prices(page)
-    bron = "ок" if availability_days else "пусто"
-    ceny = "ок" if booking_prices else "пусто"
-    _listing_log_line("брони", bron)
-    _listing_log_line("цены", ceny)
-
-    _dump_debug_html(page, base_dir, settings, item_id)
-
-    write_cutoff, availability_days, booking_prices = _sheet_write_cutoff(
-        day_at_start, availability_days, booking_prices, url, day_session,
+    t_phase = time.monotonic()
+    availability_days = _parse_listing_calendar(
+        page, url, sheet_row, item_id, day_at_start, base_dir=base_dir, settings=settings
     )
+    timings.add("календарь", time.monotonic() - t_phase)
+    t_phase = time.monotonic()
+    booking_prices = _collect_nearest_date_prices(page)
+    timings.add("цены", time.monotonic() - t_phase)
+    t_phase = time.monotonic()
+    _card_scroll_phase(page)
+    timings.add("скролл", time.monotonic() - t_phase)
+
+    t_phase = time.monotonic()
+    _dump_debug_html(page, base_dir, settings, item_id)
+    timings.add("debug", time.monotonic() - t_phase)
 
     run_detail = settings.run_detail if settings else True
     if not run_detail:
+        t_phase = time.monotonic()
+        write_cutoff, availability_days, booking_prices = _sheet_write_cutoff(
+            day_at_start, availability_days, booking_prices, url, day_session,
+        )
         booking_cell = (
             json.dumps(booking_prices, ensure_ascii=False)
             if booking_prices
@@ -1289,9 +1402,11 @@ def _process_one_url(
             sheet_worker=sheet_worker,
         )
         _listing_log_write(sheet_worker, ok)
-        _ensure_listing_pace(page, listing_started)
+        timings.add("запись", time.monotonic() - t_phase)
+        _listing_log_timings(timings)
         return record
 
+    detail_started = time.monotonic()
     title = _extract_title(page) or f"house_{item_id}"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1371,6 +1486,13 @@ def _process_one_url(
     if _normalize_space(seller_profile):
         record["ссылка создателя"] = _normalize_space(seller_profile)
 
+    timings.add("детали", time.monotonic() - detail_started)
+
+    t_phase = time.monotonic()
+    write_cutoff, availability_days, booking_prices = _sheet_write_cutoff(
+        day_at_start, availability_days, booking_prices, url, day_session,
+    )
+
     ok = _maybe_append_google_sheet(
         record, base_dir, item_id, booking_prices, url,
         sh=sh, settings=settings, removed=False, queue_next_row=queue_next_row,
@@ -1378,7 +1500,8 @@ def _process_one_url(
         sheet_worker=sheet_worker,
     )
     _listing_log_write(sheet_worker, ok)
-    _ensure_listing_pace(page, listing_started)
+    timings.add("запись", time.monotonic() - t_phase)
+    _listing_log_timings(timings)
     return record
 
 
@@ -1404,12 +1527,13 @@ def main() -> None:
     )
 
     processed_ok = 0
+    last_progress_row = first_row
+    interrupted = False
     try:
         from google_sheets.calendar import today_moscow
         from google_sheets.parse_day import ParseDaySession
 
         day_session = ParseDaySession(iteration_day=today_moscow())
-        print(f"День начала итерации (MSK): {day_session.iteration_day.isoformat()}")
     except ImportError:
         day_session = None
 
@@ -1431,10 +1555,6 @@ def main() -> None:
                 min_interval_s=interval,
                 log_urls=list(urls),
             )
-            print(
-                f"Запись в таблицу: фоновый поток "
-                f"(пауза между запросами API ≥ {interval:.1f} с)."
-            )
         except ImportError:
             sheet_worker = None
 
@@ -1442,7 +1562,7 @@ def main() -> None:
         browser = _launch_browser(p)
         context, page = _new_page(browser)
         parsed_in_session = 0
-        captcha_tail_left: int | None = None
+        captcha_streak = 0
         captcha_first_row: int | None = None
         stop_for_captcha = False
         try:
@@ -1451,9 +1571,7 @@ def main() -> None:
                 next_row = sheet_row + 1
                 if parsed_in_session >= restart_every:
                     if sheet_worker is not None and sheet_worker.pending > 0:
-                        print("Ожидание фоновой записи перед перезапуском браузера…")
                         sheet_worker.drain()
-                    print(f"Перезапуск браузера после {restart_every} объявлений…")
                     try:
                         context.close()
                     except Exception:
@@ -1478,58 +1596,66 @@ def main() -> None:
                         queue_next_row=next_row,
                         day_session=day_session,
                         sheet_worker=sheet_worker,
+                        listing_num=batch_pos,
                     )
                 except Exception as exc:
                     _listing_log_start(sheet_row, last_row)
-                    _listing_log_line("ошибка", str(exc)[:80])
+                    _listing_log_status(f"ошибка: {str(exc)[:80]}")
                     traceback.print_exc()
                     record = None
 
                 if _is_captcha_record(record):
-                    if captcha_tail_left is None:
+                    if captcha_streak == 0:
                         captcha_first_row = sheet_row
-                        captcha_tail_left = CAPTCHA_TAIL_LINKS
-                        print(
-                            f"Капча на строке {sheet_row}: "
-                            f"ещё {CAPTCHA_TAIL_LINKS} ссылок, затем остановка."
-                        )
-                    captcha_tail_left -= 1
-                elif captcha_tail_left is not None:
-                    captcha_tail_left -= 1
-
-                if captcha_tail_left is not None and captcha_tail_left <= 0:
-                    stop_for_captcha = True
-                    resume_row = max(
-                        FIRST_DATA_ROW,
-                        (captcha_first_row or sheet_row) - CAPTCHA_PROGRESS_BACK_ROWS,
-                    )
+                    captcha_streak += 1
                     print(
-                        f"Капча: стоп. Следующий запуск — со строки {resume_row} "
-                        f"(−{CAPTCHA_PROGRESS_BACK_ROWS} от строки {captcha_first_row})."
+                        f"Капча подряд {captcha_streak}/{CAPTCHA_STREAK_LIMIT} "
+                        f"(строка {sheet_row})."
                     )
-                    if sheet_worker is not None:
-                        print("Ожидание фоновой записи перед остановкой…")
-                        sheet_worker.drain()
-                    if sh is not None and settings is not None:
-                        try:
-                            from google_sheets.iterations import save_iteration_progress
+                    if captcha_streak >= CAPTCHA_STREAK_LIMIT:
+                        stop_for_captcha = True
+                        resume_row = max(
+                            FIRST_DATA_ROW,
+                            (captcha_first_row or sheet_row) - CAPTCHA_PROGRESS_BACK_ROWS,
+                        )
+                        print(
+                            f"Капча: стоп после {CAPTCHA_STREAK_LIMIT} подряд. "
+                            f"Следующий запуск — со строки {resume_row} "
+                            f"(−{CAPTCHA_PROGRESS_BACK_ROWS} от строки {captcha_first_row})."
+                        )
+                        if sheet_worker is not None:
+                            sheet_worker.drain()
+                            sheet_worker._last_progress_row = resume_row
+                        if sh is not None and settings is not None:
+                            try:
+                                from google_sheets.iterations import save_iteration_progress
 
-                            save_iteration_progress(
-                                sh,
-                                settings,
-                                resume_row,
-                                total_urls=full_queue_len,
-                            )
-                        except ImportError:
-                            pass
-                    break
+                                settings = save_iteration_progress(
+                                    sh,
+                                    settings,
+                                    resume_row,
+                                    total_urls=full_queue_len,
+                                    announce=True,
+                                )
+                                last_progress_row = resume_row
+                            except Exception as exc:
+                                print(f"Не удалось записать прогресс в настройках: {exc}")
+                        break
+                elif record is not None:
+                    captcha_streak = 0
+                    captcha_first_row = None
 
                 if _is_captcha_record(record) or record is None:
                     continue
 
                 parsed_in_session += 1
                 processed_ok += 1
+                last_progress_row = next_row
+                between_started = time.monotonic()
                 _pause_between_listings()
+                between_s = time.monotonic() - between_started
+                if between_s >= 0.2:
+                    print(f"  время: между объявлениями {between_s:.1f}с")
 
             synced_next_row: int | None = None
             if sheet_worker is not None:
@@ -1554,7 +1680,28 @@ def main() -> None:
                         )
                     except ImportError:
                         pass
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nОстановлено пользователем (Ctrl+C).")
+            raise
         finally:
+            if interrupted and sh is not None and settings is not None and not stop_for_captcha:
+                try:
+                    if sheet_worker is not None:
+                        drained = sheet_worker.drain()
+                        if drained is not None:
+                            last_progress_row = drained
+                    from google_sheets.iterations import save_iteration_progress
+
+                    save_iteration_progress(
+                        sh,
+                        settings,
+                        last_progress_row,
+                        total_urls=full_queue_len,
+                        announce=True,
+                    )
+                except Exception as exc:
+                    print(f"Не удалось сохранить прогресс в настройках: {exc}")
             if sheet_worker is not None:
                 try:
                     sheet_worker.shutdown()
@@ -1575,7 +1722,6 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nОстановлено пользователем (Ctrl+C).")
         sys.exit(130)
     except Exception:
         print("Произошла ошибка:")

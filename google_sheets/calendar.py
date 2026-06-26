@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar as cal_mod
 from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -10,7 +11,6 @@ from google_sheets.client import api_retry, ensure_worksheet, find_row_by_url_co
 from google_sheets.constants import (
     BOOKED_SLOT_MARKER,
     NOT_FOUND_ON_SITE,
-    REMOVED_LISTING_FORWARD_DAYS,
     RE_DATA_ID_PERIOD,
     RE_PERIOD,
     RE_PERIOD_CROSS_MONTH,
@@ -33,8 +33,26 @@ def today_moscow() -> date:
     return datetime.now(tz_moscow()).date()
 
 
+def calendar_window_months(today: date) -> set[tuple[int, int]]:
+    """Два месяца datepicker: текущий и следующий (без листания дальше)."""
+    y, m = today.year, today.month
+    if m < 12:
+        return {(y, m), (y, m + 1)}
+    return {(y, m), (y + 1, 1)}
+
+
+def calendar_window_end(today: date) -> date:
+    """Последний день следующего месяца от today."""
+    y, m = today.year, today.month
+    if m < 12:
+        ny, nm = y, m + 1
+    else:
+        ny, nm = y + 1, 1
+    return date(ny, nm, cal_mod.monthrange(ny, nm)[1])
+
+
 def filter_availability_day_map(day_map: dict[date, str], cutoff: date) -> dict[date, str]:
-    """Только даты >= cutoff (прошлые ячейки листа не перезаписываем)."""
+    """Только даты >= cutoff (месяцы — из datepicker на карточке, не фильтруем здесь)."""
     return {d: v for d, v in (day_map or {}).items() if d >= cutoff}
 
 
@@ -336,10 +354,18 @@ def open_calendar_ws(sh: Any, settings: ParserSettings, *, availability: bool) -
     return ws
 
 
-def removed_listing_dates(today: date, forward_days: int = REMOVED_LISTING_FORWARD_DAYS) -> set[date]:
-    """Дни для «нету на сайте», если объявление снято (сегодня + forward_days−1)."""
-    n = max(1, forward_days)
-    return {today + timedelta(days=i) for i in range(n)}
+def removed_listing_dates(today: date, forward_days: int | None = None) -> set[date]:
+    """Дни для «нету на сайте»: от today до конца следующего месяца (как у живого datepicker)."""
+    if forward_days is not None:
+        n = max(1, forward_days)
+        return {today + timedelta(days=i) for i in range(n)}
+    end = calendar_window_end(today)
+    out: set[date] = set()
+    d = today
+    while d <= end:
+        out.add(d)
+        d += timedelta(days=1)
+    return out
 
 
 def _read_row_values_by_date(

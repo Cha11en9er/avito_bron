@@ -5,6 +5,7 @@ from __future__ import annotations
 import calendar
 import time
 from datetime import date
+from pathlib import Path
 from typing import Any, Literal
 
 DayState = Literal["free", "booked", "skip"]
@@ -12,7 +13,7 @@ DayState = Literal["free", "booked", "skip"]
 INITIAL_PANEL_COUNT = 2
 TOTAL_MONTH_COUNT = 2
 EXTRA_MONTH_NAV_CLICKS = 0
-DATEPICKER_READY_MS = 5000
+DATEPICKER_READY_MS = 2200
 DATEPICKER_READY_AFTER_NAV_MS = 4000
 
 NEXT_MONTH_SELECTORS: tuple[str, ...] = (
@@ -21,10 +22,15 @@ NEXT_MONTH_SELECTORS: tuple[str, ...] = (
     "._4c628a411bf08f14._5f2feca9eafe0236",
 )
 
+PREV_MONTH_SELECTORS: tuple[str, ...] = (
+    '[data-marker="datepicker/prev-button"]',
+    '[data-marker="datepicker/previous-button"]',
+)
+
 _DATEPICKER_READY_JS = """
-() => {
+(minPanels) => {
   const panels = document.querySelectorAll('[data-marker^="datepicker/calendar("]');
-  if (panels.length === 0) return 0;
+  if (panels.length < minPanels) return 0;
   const sel = '[data-marker="datepicker-day-available"], [data-marker="datepicker-day-disabled"]';
   let n = 0;
   for (let i = 0; i < Math.min(2, panels.length); i++) {
@@ -49,9 +55,16 @@ _PARSE_JS = """
     return null;
   };
   const panelYearMonth = (panel) => {
+    const marker = panel.getAttribute("data-marker") || "";
     let year = null;
     let month = null;
     let panelTitle = "";
+    const mm = marker.match(/calendar\\((\\d+)-(\\d+)\\)/);
+    if (mm) {
+      year = parseInt(mm[1], 10);
+      // Avito: месяц в data-marker 0-based (5 = июнь). Даты — 1-based.
+      month = parseInt(mm[2], 10) + 1;
+    }
     for (const div of panel.querySelectorAll("div")) {
       const spans = Array.from(div.querySelectorAll(":scope > span"));
       if (spans.length < 2) continue;
@@ -60,26 +73,38 @@ _PARSE_JS = """
       const mA = parseMonthName(a);
       const yB = parseInt(b, 10);
       if (mA && yB > 2000) {
-        month = mA;
-        year = yB;
         panelTitle = a + " " + b;
         break;
       }
       const mB = parseMonthName(b);
       const yA = parseInt(a, 10);
       if (mB && yA > 2000) {
-        month = mB;
-        year = yA;
         panelTitle = b + " " + a;
         break;
       }
     }
-    const marker = panel.getAttribute("data-marker") || "";
-    if (!month || !year) {
-      const mm = marker.match(/calendar\\((\\d+)-(\\d+)\\)/);
-      if (mm) {
-        year = parseInt(mm[1], 10);
-        month = parseInt(mm[2], 10);
+    if (!year || !month) {
+      for (const div of panel.querySelectorAll("div")) {
+        const spans = Array.from(div.querySelectorAll(":scope > span"));
+        if (spans.length < 2) continue;
+        const a = (spans[0].textContent || "").trim();
+        const b = (spans[1].textContent || "").trim();
+        const mA = parseMonthName(a);
+        const yB = parseInt(b, 10);
+        if (mA && yB > 2000) {
+          month = mA;
+          year = yB;
+          panelTitle = a + " " + b;
+          break;
+        }
+        const mB = parseMonthName(b);
+        const yA = parseInt(a, 10);
+        if (mB && yA > 2000) {
+          month = mB;
+          year = yA;
+          panelTitle = b + " " + a;
+          break;
+        }
       }
     }
     if (!panelTitle && month && year) {
@@ -224,34 +249,49 @@ def parse_datepicker_rows(
             continue
         year = int(rows[0]["year"])
         month = int(rows[0]["month"])
-        out.extend(resolve_panel_days(year, month, rows))
+        for d, state in resolve_panel_days(year, month, rows):
+            # Прошлые disabled на Авито — не бронь, а неактивные даты.
+            if state == "booked" and d < today:
+                continue
+            out.append((d, state))  # type: ignore[arg-type]
     return out
 
 
-def _nudge_second_panel(page) -> None:
+def _nudge_calendar_panel(page, panel_index: int) -> None:
     try:
         page.evaluate(
             """
-            () => {
+            (idx) => {
               const panels = document.querySelectorAll(
                 '[data-marker^="datepicker/calendar("]'
               );
-              if (panels.length > 1) {
-                panels[1].scrollIntoView({ block: 'nearest', inline: 'end' });
+              if (panels.length > idx) {
+                panels[idx].scrollIntoView({ block: 'nearest', inline: idx ? 'end' : 'start' });
               }
             }
-            """
+            """,
+            panel_index,
         )
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(300)
     except Exception:
         pass
 
 
-def wait_datepicker_ready(page, timeout_ms: int = 20000, min_day_labels: int = 7) -> bool:
+def _nudge_second_panel(page) -> None:
+    _nudge_calendar_panel(page, 1)
+
+
+def wait_datepicker_ready(
+    page,
+    timeout_ms: int = 20000,
+    min_day_labels: int = 7,
+    *,
+    min_panels: int = 1,
+) -> bool:
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
         try:
-            n = page.evaluate(_DATEPICKER_READY_JS)
+            n = page.evaluate(_DATEPICKER_READY_JS, min_panels)
             if isinstance(n, (int, float)) and n >= min_day_labels:
                 return True
         except Exception:
@@ -271,8 +311,150 @@ def _panel_titles_from_raw(raw: list[dict[str, Any]]) -> list[str]:
     return seen[:TOTAL_MONTH_COUNT]
 
 
-def _months_in_raw(raw: list[dict[str, Any]]) -> set[tuple[int, int]]:
-    return {(int(r["year"]), int(r["month"])) for r in raw if r.get("year") and r.get("month")}
+def _panel_months_from_raw(raw: list[dict[str, Any]]) -> set[tuple[int, int]]:
+    """Два месяца видимых панелей datepicker (по data-marker calendar(Y-M), 0-based → +1)."""
+    by_panel: dict[int, tuple[int, int]] = {}
+    for row in raw:
+        if not row.get("year") or not row.get("month"):
+            continue
+        pi = int(row.get("panelIndex", 0))
+        if pi not in by_panel:
+            by_panel[pi] = (int(row["year"]), int(row["month"]))
+    return {by_panel[i] for i in sorted(by_panel) if i < INITIAL_PANEL_COUNT}
+
+
+def _expected_panel_months(today: date) -> set[tuple[int, int]]:
+    """Текущий и следующий месяц — то, что должно быть в двух панелях datepicker."""
+    y, m = today.year, today.month
+    if m < 12:
+        return {(y, m), (y, m + 1)}
+    return {(y, m), (y + 1, 1)}
+
+
+def _wrong_month_window(seen_months: set[tuple[int, int]], today: date) -> bool:
+    """Панели сдвинуты (например июль+август вместо июня+июля)."""
+    if not seen_months:
+        return True
+    cur = (today.year, today.month)
+    if cur not in seen_months:
+        return True
+    if min(seen_months) > cur:
+        return True
+    return False
+
+
+def _parse_panels_once(
+    page,
+    today: date,
+) -> tuple[list[dict[str, Any]], set[tuple[int, int]], list[str], dict[date, str], dict[date, str]]:
+    _nudge_calendar_panel(page, 0)
+    _nudge_second_panel(page)
+    wait_datepicker_ready(
+        page,
+        timeout_ms=DATEPICKER_READY_MS,
+        min_day_labels=14,
+        min_panels=INITIAL_PANEL_COUNT,
+    )
+    raw = page.evaluate(_PARSE_JS)
+    if not isinstance(raw, list):
+        raw = []
+    seen_months = _panel_months_from_raw(raw)
+    panel_titles = _panel_titles_from_raw(raw)
+    all_days: dict[date, str] = {}
+    future: dict[date, str] = {}
+    _apply_raw_to_maps(raw, today, all_days, future)
+    return raw, seen_months, panel_titles, all_days, future
+
+
+def _click_prev_month(page) -> bool:
+    for sel in PREV_MONTH_SELECTORS:
+        loc = page.locator(sel).first
+        try:
+            if loc.count() == 0 or not loc.is_visible(timeout=2000):
+                continue
+            loc.click(timeout=8000)
+            page.wait_for_timeout(500)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _align_calendar_to_today(page, today: date, *, max_clicks: int = 8) -> bool:
+    """Листаем назад, пока в панелях не появится текущий месяц."""
+    for _ in range(max_clicks):
+        raw = page.evaluate(_PARSE_JS)
+        if isinstance(raw, list) and (today.year, today.month) in _panel_months_from_raw(raw):
+            return True
+        if not _click_prev_month(page):
+            return False
+        page.wait_for_timeout(400)
+    raw = page.evaluate(_PARSE_JS)
+    return isinstance(raw, list) and (today.year, today.month) in _panel_months_from_raw(raw)
+
+
+def _panels_parse_incomplete(
+    raw: list[dict[str, Any]],
+    seen_months: set[tuple[int, int]],
+    future: dict[date, str],
+    today: date,
+) -> bool:
+    by_panel = {
+        i
+        for i in {int(r.get("panelIndex", 0)) for r in raw}
+        if i < INITIAL_PANEL_COUNT
+    }
+    if len(by_panel) < INITIAL_PANEL_COUNT or len(seen_months) < INITIAL_PANEL_COUNT:
+        return True
+    if not any(d >= today for d in future):
+        return True
+    if _wrong_month_window(seen_months, today):
+        return True
+    return False
+
+
+def _dump_calendar_parse_debug(
+    debug_dir: Path,
+    item_id: str,
+    *,
+    today: date,
+    raw: list[dict[str, Any]],
+    seen_months: set[tuple[int, int]],
+    future: dict[date, str],
+    panel_titles: list[str],
+    incomplete: bool,
+) -> Path:
+    import json
+    from datetime import datetime
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = debug_dir / f"{item_id}_{stamp}_calendar.json"
+    booked = sum(1 for r in raw if r.get("state") == "booked")
+    free = sum(1 for r in raw if r.get("state") == "free")
+    payload = {
+        "item_id": item_id,
+        "today": today.isoformat(),
+        "incomplete": incomplete,
+        "panel_titles": panel_titles,
+        "seen_months": [f"{y}-{m:02d}" for y, m in sorted(seen_months)],
+        "expected_months": [
+            f"{y}-{m:02d}" for y, m in sorted(_expected_panel_months(today))
+        ],
+        "wrong_month_window": _wrong_month_window(seen_months, today),
+        "future": {d.isoformat(): v for d, v in sorted(future.items())},
+        "raw_stats": {"rows": len(raw), "booked_cells": booked, "free_cells": free},
+        "raw_sample": raw[:40],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _window_end_for_panel_months(months: set[tuple[int, int]]) -> date | None:
+    if not months:
+        return None
+    y, m = max(months)
+    return date(y, m, calendar.monthrange(y, m)[1])
 
 
 def _apply_raw_to_maps(
@@ -320,7 +502,7 @@ def _add_month_from_nav(
     raw_next = page.evaluate(_PARSE_JS)
     if not isinstance(raw_next, list):
         return False
-    new_months = sorted(_months_in_raw(raw_next) - seen_months)
+    new_months = sorted(_panel_months_from_raw(raw_next) - seen_months)
     if not new_months:
         return False
     anchor = max(seen_months) if seen_months else (0, 0)
@@ -337,35 +519,87 @@ def _add_month_from_nav(
     return True
 
 
-def read_availability_panels(page, today: date) -> tuple[dict[date, str], dict[date, str], list[str]]:
+def read_availability_panels(
+    page,
+    today: date,
+    *,
+    debug_dir: Path | None = None,
+    incomplete_debug_dir: Path | None = None,
+    debug_id: str = "",
+) -> tuple[dict[date, str], dict[date, str], list[str]]:
     """
     Две панели datepicker как на экране (без кнопки «следующий месяц»).
     В таблицу попадают только даты >= today.
     """
-    _nudge_second_panel(page)
-    wait_datepicker_ready(page, timeout_ms=DATEPICKER_READY_MS, min_day_labels=14)
-    raw_first = page.evaluate(_PARSE_JS)
-    if not isinstance(raw_first, list):
-        return {}, {}, []
-
-    seen_months = _months_in_raw(raw_first)
-    panel_titles = _panel_titles_from_raw(raw_first)
-
+    max_attempts = 3
+    raw_first: list[dict[str, Any]] = []
+    seen_months: set[tuple[int, int]] = set()
+    panel_titles: list[str] = []
     all_days: dict[date, str] = {}
     future: dict[date, str] = {}
-    _apply_raw_to_maps(raw_first, today, all_days, future)
+    incomplete = True
+
+    for attempt in range(max_attempts):
+        raw, seen_months, panel_titles, all_days, future = _parse_panels_once(page, today)
+        incomplete = _panels_parse_incomplete(raw, seen_months, future, today)
+        raw_first = raw
+
+        if incomplete and _wrong_month_window(seen_months, today):
+            if _align_calendar_to_today(page, today):
+                raw, seen_months, panel_titles, all_days, future = _parse_panels_once(page, today)
+                incomplete = _panels_parse_incomplete(raw, seen_months, future, today)
+                raw_first = raw
+
+        if not incomplete or attempt + 1 >= max_attempts:
+            break
+        page.wait_for_timeout(400 * (attempt + 1))
+
+    if incomplete:
+        dump_dir = debug_dir or incomplete_debug_dir
+        if dump_dir is not None and debug_id:
+            path = _dump_calendar_parse_debug(
+                dump_dir,
+                debug_id,
+                today=today,
+                raw=raw_first,
+                seen_months=seen_months,
+                future=future,
+                panel_titles=panel_titles,
+                incomplete=True,
+            )
+            print(
+                f"  календарь: неполные панели {sorted(seen_months)} "
+                f"(ожидались {_expected_panel_months(today)}) → debug {path}"
+            )
+        return {}, {}, panel_titles[:TOTAL_MONTH_COUNT]
+
+    if debug_dir is not None and debug_id:
+        _dump_calendar_parse_debug(
+            debug_dir,
+            debug_id,
+            today=today,
+            raw=raw_first,
+            seen_months=seen_months,
+            future=future,
+            panel_titles=panel_titles,
+            incomplete=False,
+        )
 
     for _ in range(EXTRA_MONTH_NAV_CLICKS):
         if len(seen_months) >= TOTAL_MONTH_COUNT:
             break
         _add_month_from_nav(page, today, seen_months, panel_titles, all_days, future)
 
-    allowed = set(seen_months)
+    allowed = seen_months
+    window_end = _window_end_for_panel_months(allowed)
 
     def _clip_months(m: dict[date, str]) -> dict[date, str]:
         if not allowed:
             return m
-        return {d: v for d, v in m.items() if (d.year, d.month) in allowed}
+        clipped = {d: v for d, v in m.items() if (d.year, d.month) in allowed}
+        if window_end is not None:
+            clipped = {d: v for d, v in clipped.items() if d <= window_end}
+        return clipped
 
     return _clip_months(future), _clip_months(all_days), panel_titles[:TOTAL_MONTH_COUNT]
 

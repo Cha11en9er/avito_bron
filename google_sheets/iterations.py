@@ -411,11 +411,19 @@ def save_iteration_progress(
     next_sheet_row: int,
     *,
     total_urls: int | None = None,
+    announce: bool = False,
 ) -> ParserSettings:
     """next_sheet_row — следующая строка после обработанной; при конце списка — новая итерация."""
+    from dataclasses import replace
+
     it = max(1, settings.parse_iteration)
     if total_urls and next_sheet_row > last_data_row(total_urls):
         return complete_iteration(sh, settings, total_links=total_urls)
+
+    if announce:
+        from google_sheets.settings import clear_settings_row_cache
+
+        clear_settings_row_cache()
 
     save_settings_values(
         sh,
@@ -425,7 +433,17 @@ def save_iteration_progress(
             "iteration_progress_for": str(it),
         },
     )
-    return settings
+    updated = replace(
+        settings,
+        iteration_progress=next_sheet_row,
+        iteration_progress_for=it,
+    )
+    if announce:
+        print(
+            f"В настройках: iteration_progress={next_sheet_row}, "
+            f"iteration_progress_for={it} (итерация {it})."
+        )
+    return updated
 
 
 def begin_iteration(

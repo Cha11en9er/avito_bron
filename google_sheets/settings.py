@@ -60,162 +60,221 @@ class ParserSettings:
         return {f.name for f in fields(cls)}
 
 
-SETTINGS_DYNAMIC: list[tuple[str, str, str]] = [
+SETTINGS_SYSTEM: list[tuple[str, str, str]] = [
+    (
+        "sheet_sync_min_interval_s",
+        "3.5",
+        "Системное: минимальная пауза (сек.) между запросами к Google Sheets API в фоновом потоке.",
+    ),
+    (
+        "browser_restart_every",
+        "10",
+        "Системное: после скольких успешно обработанных объявлений перезапустить браузер.",
+    ),
+    (
+        "debug_dump_html",
+        "0",
+        "Системное: 1 — сохранять HTML карточки в debug_html_dir для отладки; 0 — не сохранять.",
+    ),
+]
+
+SETTINGS_SEPARATOR_ROW: tuple[str, str, str] = (
+    "",
+    "",
+    "——— Настройки прогона (меняются чаще) ———",
+)
+
+SETTINGS_USER: list[tuple[str, str, str]] = [
     (
         "sync_from_links_sheet",
         "1",
-        "Откуда брать список URL для парсинга. 1 — из листа «ссылки» (столбец A); при запуске "
-        "новые URL дописываются в конец рабочих листов, а строки с URL, которых уже нет в «ссылки», "
-        "удаляются (со смещением) на «сдаваемость», «цены», «логи» и «деталь» (если включены). "
-        "0 — очередь только из «сдаваемость»; лист «ссылки» не читается, автоудаления нет.",
+        "Откуда брать список URL. 1 — из листа «ссылки» (столбец A); новые URL дописываются в конец "
+        "рабочих листов, удалённые из «ссылки» убираются со смещением. "
+        "0 — очередь только из «сдаваемость»; лист «ссылки» не читается.",
     ),
     (
         "detail_range_from",
         "0",
-        "С какой строки листа начать (строка 2 = первая ссылка). 0+0 — весь список.",
+        "С какой строки листа начать (строка 2 = первая ссылка). 0 и 0 — весь список.",
     ),
     (
         "detail_range_to",
         "0",
         "До какой строки включительно. Примеры: 2 и 11 → строки 2–11; 2188 и 2188 — одна строка; "
-        "2188 и 0 — с 2188 до конца; 0 и 0 — весь список.",
-    ),
-    (
-        "browser_restart_every",
-        "10",
-        "После скольких успешно обработанных объявлений перезапустить браузер (снижает сбои и утечки памяти).",
-    ),
-    (
-        "sheet_sync_min_interval_s",
-        "3.5",
-        "Минимальная пауза (сек.) между запросами к Google Sheets API в фоновом потоке (лимит read requests/min).",
-    ),
-    (
-        "run_detail",
-        "0",
-        "1 — дополнительно парсить лист «детальная информация» (телефон, описание, фото, характеристики). "
-        "0 — только бронь и цены (если run_calendar=1). Обычно для ежедневного прогона: 0.",
-    ),
-    (
-        "detail_fill_mode",
-        "append",
-        "Только если run_detail=1. primary — полностью пересоздать лист «детальная информация» "
-        "по текущему списку «ссылки» (все старые строки и данные удаляются), затем парсить. "
-        "rebuild — очистить лист и заново заполнить только столбец URL из «ссылки», без парсинга карточек. "
-        "append — не удалять лист; парсить только строки, где в колонке «название» пусто (см. detail_only_empty_title).",
-    ),
-    (
-        "detail_only_empty_title",
-        "1",
-        "Только при detail_fill_mode=append. 1 — пропускать строки, у которых «название» уже заполнено "
-        "(удобно догонять новые ссылки). 0 — при append обрабатывать все URL из диапазона, даже с заполненным названием.",
+        "2188 и 0 — с 2188 до конца.",
     ),
     (
         "run_calendar",
         "1",
-        "1 — парсить «сдаваемость по дням» и «цены по дням» с Avito (основной режим). "
-        "0 — календарь не трогать (имеет смысл только при отладке).",
+        "1 — парсить «сдаваемость по дням» (datepicker: 2 месяца — текущий и следующий, без листания) "
+        "и «цены по дням» (карусель «ближайшие даты», не дальше 2 мес.). "
+        "0 — календарь не трогать.",
     ),
     (
         "calendar_mode",
         "daily",
-        "Только если run_calendar=1. daily — оставить существующие строки и даты; дописать новые URL "
-        "в конец; обновлять ячейки по мере парсинга. primary — один раз пересоздать листы «сдаваемость» "
-        "и «цены» только по текущему списку «ссылки» (старые URL и все 0/1/цены удаляются; нужен повторный прогон парсера). "
-        "Нужен sync_from_links_sheet=1.",
+        "daily — не удалять строки; столбцы дат добавляются при парсинге; пишутся дни ≥ сегодня (MSK). "
+        "primary — один раз пересоздать листы «сдаваемость» и «цены» по списку «ссылки» "
+        "(нужен sync_from_links_sheet=1), затем вернуть daily.",
     ),
     (
-        "calendar_start_date",
-        "03.05",
-        "Только при calendar_mode=primary: с какой даты начать столбцы календаря (формат ДД.ММ).",
-    ),
-    (
-        "calendar_start_year",
-        "2026",
-        "Год для подписей дат в заголовках (ДД.ММ).",
-    ),
-    (
-        "calendar_horizon_days",
-        "90",
-        "Только при calendar_mode=primary: сколько дней вперёд заложить в шапку при пересоздании листа.",
-    ),
-    (
-        "debug_dump_html",
+        "run_detail",
         "0",
-        "1 — сохранять HTML каждой карточки в папку debug_html_dir (для отладки). 0 — не сохранять.",
+        "1 — дополнительно парсить «детальная информация» (телефон, описание, фото). "
+        "0 — только календарь (обычно для ежедневного прогона).",
     ),
-    ("debug_html_dir", "debug_html", "Папка для HTML-файлов (от корня проекта avito_bron)."),
+    (
+        "detail_fill_mode",
+        "append",
+        "Только при run_detail=1. primary — пересоздать лист «детальная информация» по «ссылки». "
+        "rebuild — очистить лист и заново заполнить только URL. "
+        "append — парсить строки с пустым «название» (см. detail_only_empty_title).",
+    ),
+    (
+        "detail_only_empty_title",
+        "1",
+        "При detail_fill_mode=append: 1 — пропускать строки с заполненным «название»; "
+        "0 — парсить все URL из диапазона.",
+    ),
     (
         "parse_iteration",
         "1",
-        "Номер текущего «прогона» по всему списку. После полного прохода всех ссылок парсер "
-        "сам увеличивает на 1 и останавливается (второй прогон в том же запуске не начинается). "
-        "Следующий раз — только вручную: python -m parser. Можно вручную сменить номер итерации.",
+        "Номер текущего прогона по всему списку. После полного прохода парсер увеличивает на 1. "
+        "Следующий прогон — только при новом запуске python -m parser.",
     ),
     (
         "iteration_progress",
         "0",
         "С какой строки продолжить: 0 — с начала (строка 2); 2188 — со строки 2188. "
-        "После полного прохода парсер сам ставит 0 и увеличивает parse_iteration.",
+        "После полного прохода парсер ставит 0.",
     ),
     (
-        "iteration_slot_0",
-        "1",
-        "Служебное: номер итерации в 1-м блоке логов (колонки C–F: ит.N, дата, время, статус). Обновляется парсером.",
+        "calendar_start_date",
+        "03.05",
+        "Только при calendar_mode=primary: с какой даты начать столбцы (ДД.ММ). В daily не используется.",
     ),
     (
-        "iteration_slot_1",
-        "2",
-        "Служебное: номер итерации во 2-м блоке (H–K).",
+        "calendar_start_year",
+        "2026",
+        "Год для заголовков столбцов дат (ДД.ММ).",
     ),
     (
-        "iteration_slot_2",
-        "3",
-        "Служебное: номер итерации в 3-м блоке (M–P). Кольцо из трёх последних прогонов.",
+        "calendar_horizon_days",
+        "90",
+        "Зарезервировано (столбцы в daily добавляются при парсинге). На работу парсера не влияет.",
     ),
     (
-        "iteration_progress_for",
-        "1",
-        "Служебное: для какой итерации записан iteration_progress. При смене parse_iteration вручную "
-        "парсер обнуляет прогресс. Можно не трогать.",
+        "debug_html_dir",
+        "debug_html",
+        "Папка для HTML-дампов (от корня проекта), если debug_dump_html=1.",
     ),
-    (
-        "iteration_logs_cleared_for",
-        "0",
-        "Служебное: для какой итерации уже очищен блок логов (ит./дата/время/статус). "
-        "При новой итерации парсер сам очистит свой слот. Можно не трогать.",
-    ),
-]
-
-SETTINGS_SHEET_NAMES: list[tuple[str, str, str]] = [
-    ("sheet_links", DEFAULT_WORKSHEET_LINKS, "Имя листа со списком URL (столбец A)."),
-    ("sheet_detail", DEFAULT_WORKSHEET_DETAIL, "Имя листа детальной информации."),
-    ("sheet_availability", DEFAULT_WORKSHEET_AVAILABILITY, "Имя листа сдаваемости по дням (0/1)."),
-    ("sheet_prices", DEFAULT_WORKSHEET_PRICES_DAYS, "Имя листа цен по дням."),
-    ("sheet_logs", DEFAULT_WORKSHEET_LOGS, "Имя листа логов парсинга."),
-    ("sheet_settings", DEFAULT_WORKSHEET_SETTINGS, "Имя этого листа настроек."),
 ]
 
 SETTINGS_SHEET_GAP_ROWS = 5
 
+SETTINGS_SHEET_NAMES: list[tuple[str, str, str]] = [
+    ("sheet_links", DEFAULT_WORKSHEET_LINKS, "Служебное: имя листа со списком URL (столбец A)."),
+    ("sheet_detail", DEFAULT_WORKSHEET_DETAIL, "Служебное: имя листа детальной информации."),
+    (
+        "sheet_availability",
+        DEFAULT_WORKSHEET_AVAILABILITY,
+        "Служебное: имя листа сдаваемости по дням (0/1).",
+    ),
+    ("sheet_prices", DEFAULT_WORKSHEET_PRICES_DAYS, "Служебное: имя листа цен по дням."),
+    ("sheet_logs", DEFAULT_WORKSHEET_LOGS, "Служебное: имя листа логов парсинга."),
+    ("sheet_settings", DEFAULT_WORKSHEET_SETTINGS, "Служебное: имя этого листа настроек."),
+]
 
-def _build_settings_body() -> list[list[str]]:
+SETTINGS_SHEET_INTERNAL: list[tuple[str, str, str]] = [
+    (
+        "iteration_progress_for",
+        "1",
+        "Служебное: для какой итерации записан iteration_progress. Обновляется парсером.",
+    ),
+    (
+        "iteration_logs_cleared_for",
+        "0",
+        "Служебное: для какой итерации уже очищен блок в логах. Обновляется парсером.",
+    ),
+    (
+        "iteration_slot_0",
+        "1",
+        "Служебное: номер итерации в 1-м блоке логов (C–F). Обновляется парсером.",
+    ),
+    (
+        "iteration_slot_1",
+        "2",
+        "Служебное: номер итерации во 2-м блоке (H–K). Обновляется парсером.",
+    ),
+    (
+        "iteration_slot_2",
+        "3",
+        "Служебное: номер итерации в 3-м блоке (M–P). Обновляется парсером.",
+    ),
+]
+
+ALL_SETTINGS_ENTRIES = (
+    SETTINGS_SYSTEM + SETTINGS_USER + SETTINGS_SHEET_NAMES + SETTINGS_SHEET_INTERNAL
+)
+
+
+def _settings_value(key: str, default: str, kv: dict[str, str] | None) -> str:
+    if kv is None:
+        return default
+    return kv.get(key, default)
+
+
+def _reset_settings_format(ws: Any, num_rows: int) -> None:
+    plain = {
+        "backgroundColor": {"red": 1, "green": 1, "blue": 1},
+        "textFormat": {"bold": False, "foregroundColor": {"red": 0, "green": 0, "blue": 0}},
+        "horizontalAlignment": "LEFT",
+    }
+    cell_range = f"A1:C{max(num_rows, 40)}"
+
+    def _fmt() -> None:
+        ws.format(cell_range, plain)
+
+    api_retry(_fmt)
+
+
+def _build_settings_body(kv: dict[str, str] | None = None) -> list[list[str]]:
     header = ["ключ", "значение", "описание"]
     body: list[list[str]] = [header]
-    for key, val, hint in SETTINGS_DYNAMIC:
-        body.append([key, val, hint])
-    body.append(
-        [
-            "",
-            "",
-            "——— Ниже только имена листов в Google Таблице (не настройки парсера) ———",
-        ]
-    )
+    for key, default, hint in SETTINGS_SYSTEM:
+        body.append([key, _settings_value(key, default, kv), hint])
+    body.append(list(SETTINGS_SEPARATOR_ROW))
+    for key, default, hint in SETTINGS_USER:
+        body.append([key, _settings_value(key, default, kv), hint])
     for _ in range(SETTINGS_SHEET_GAP_ROWS):
         body.append(["", "", ""])
-    for key, val, hint in SETTINGS_SHEET_NAMES:
-        body.append([key, val, hint])
+    for key, default, hint in SETTINGS_SHEET_NAMES:
+        body.append([key, _settings_value(key, default, kv), hint])
+    for key, default, hint in SETTINGS_SHEET_INTERNAL:
+        body.append([key, _settings_value(key, default, kv), hint])
     return body
+
+
+def _read_settings_kv(rows: list[list[str]]) -> dict[str, str]:
+    kv: dict[str, str] = {}
+    for row in rows[1:]:
+        if not row:
+            continue
+        key = (row[0] or "").strip()
+        if not key:
+            continue
+        kv[key] = (row[1] if len(row) > 1 else "").strip()
+    return kv
+
+
+def _write_settings_body(ws: Any, body: list[list[str]]) -> None:
+    def _write() -> None:
+        ws.clear()
+        ws.update("A1", body, value_input_option="USER_ENTERED")
+
+    api_retry(_write)
+    _reset_settings_format(ws, len(body))
+    clear_settings_row_cache()
 
 
 def _parse_bool(raw: str) -> bool:
@@ -271,47 +330,42 @@ def _sheet_has_settings_rows(rows: list[list[str]]) -> bool:
     return False
 
 
-def seed_settings_sheet(ws: Any, *, force: bool = False) -> None:
+def seed_settings_sheet(ws: Any, *, force: bool = False, refresh: bool = False) -> None:
     rows = ws.get_all_values()
-    if not force and _sheet_has_settings_rows(rows):
-        existing = {(row[0] or "").strip() for row in rows[1:] if row}
-        missing = [
-            (k, v, h)
-            for k, v, h in SETTINGS_DYNAMIC + SETTINGS_SHEET_NAMES
-            if k and k not in existing
-        ]
-        if not missing:
-            return
-        header = rows[0] if rows and rows[0] else ["ключ", "значение", "описание"]
-        if not header or not (header[0] or "").strip():
-            header = ["ключ", "значение", "описание"]
-        body: list[list[str]] = [header]
-        for row in rows[1:]:
-            key = (row[0] or "").strip() if row else ""
-            if not key:
-                continue
-            val = row[1] if len(row) > 1 else ""
-            hint = row[2] if len(row) > 2 else ""
-            body.append([key, val, hint])
-        for key, val, hint in missing:
-            body.append([key, val, hint])
-
-        def _append() -> None:
-            ws.clear()
-            ws.update("A1", body, value_input_option="USER_ENTERED")
-
-        api_retry(_append)
-        print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}»: добавлено ключей — {len(missing)}.")
+    if refresh or force:
+        kv = None if force else _read_settings_kv(rows)
+        body = _build_settings_body(kv)
+        _write_settings_body(ws, body)
+        if force:
+            print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}» перезаписан значениями по умолчанию.")
+        else:
+            print(
+                f"Лист «{DEFAULT_WORKSHEET_SETTINGS}» обновлён: новая структура и описания, "
+                "значения сохранены."
+            )
         return
 
-    body = _build_settings_body()
+    if not _sheet_has_settings_rows(rows):
+        body = _build_settings_body()
+        _write_settings_body(ws, body)
+        print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}» заполнен значениями по умолчанию.")
+        return
 
-    def _write() -> None:
-        ws.clear()
-        ws.update("A1", body, value_input_option="USER_ENTERED")
+    existing = {(row[0] or "").strip() for row in rows[1:] if row}
+    missing = [
+        (k, v, h)
+        for k, v, h in ALL_SETTINGS_ENTRIES
+        if k and k not in existing
+    ]
+    if not missing:
+        return
 
-    api_retry(_write)
-    print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}» заполнен значениями по умолчанию.")
+    kv = _read_settings_kv(rows)
+    for key, default, hint in missing:
+        kv[key] = kv.get(key, default)
+    body = _build_settings_body(kv)
+    _write_settings_body(ws, body)
+    print(f"Лист «{DEFAULT_WORKSHEET_SETTINGS}»: добавлено ключей — {len(missing)}.")
 
 
 def load_settings(base_dir: Path, sh: Any) -> ParserSettings:
@@ -389,16 +443,29 @@ def save_settings_values(sh: Any, settings: ParserSettings, updates: dict[str, s
     from gspread.utils import rowcol_to_a1
 
     ws = ensure_worksheet(sh, settings.sheet_settings, rows=100, cols=4)
-    key_to_row = _settings_key_row_map(ws)
 
-    body: list[dict] = []
-    for key, val in updates.items():
-        r = key_to_row.get(key)
-        if r is None:
-            continue
-        body.append({"range": rowcol_to_a1(r, 2), "values": [[val]]})
+    def _body_for(keys: dict[str, int]) -> list[dict]:
+        body: list[dict] = []
+        for key, val in updates.items():
+            r = keys.get(key)
+            if r is None:
+                continue
+            body.append({"range": rowcol_to_a1(r, 2), "values": [[val]]})
+        return body
+
+    key_to_row = _settings_key_row_map(ws)
+    body = _body_for(key_to_row)
+    if not body and updates:
+        clear_settings_row_cache()
+        key_to_row = _settings_key_row_map(ws)
+        body = _body_for(key_to_row)
 
     if not body:
+        if updates:
+            print(
+                "Предупреждение: не записано в настройки — ключи не найдены на листе: "
+                + ", ".join(sorted(updates))
+            )
         return
 
     def _do() -> None:
@@ -439,9 +506,9 @@ def _settings_key_row_map(ws: Any) -> dict[str, int]:
     return key_to_row
 
 
-def seed_settings_workbook(base_dir: Path, *, force: bool = False) -> None:
+def seed_settings_workbook(base_dir: Path, *, force: bool = False, refresh: bool = False) -> None:
     from google_sheets.client import open_spreadsheet
 
     sh = open_spreadsheet(base_dir)
     ws = ensure_worksheet(sh, DEFAULT_WORKSHEET_SETTINGS, rows=100, cols=4)
-    seed_settings_sheet(ws, force=force)
+    seed_settings_sheet(ws, force=force, refresh=refresh)

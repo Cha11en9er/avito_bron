@@ -69,19 +69,8 @@ class AsyncSheetSyncWorker:
         """Конец прогона: дождаться всей очереди и сохранить прогресс в настройках."""
         if self._finalized:
             return self._last_progress_row
-        pending = self.pending
-        unfinished = self._q.unfinished_tasks
-        if pending > 0 or unfinished > 0:
-            print(
-                f"Синхронизация с Google Таблицей: "
-                f"ожидание записи ({pending} в работе, {unfinished} в очереди)…"
-            )
         row = self.drain()
         self._finalized = True
-        if row is not None:
-            print(f"  таблица: прогресс сохранён, следующая строка {row}.")
-        else:
-            print("  таблица: очередь записи пуста.")
         return row
 
     def shutdown(self, *, wait: bool = True) -> None:

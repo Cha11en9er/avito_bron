@@ -1,8 +1,9 @@
 """Утилиты Google Таблицы.
 
-  python -m google_sheets seed-settings        — лист «настройки»
-  python -m google_sheets seed-settings --force
-  python -m google_sheets seed-logs            — лист «логи ежедневного парсинга»
+  python -m google_sheets seed-settings            — лист «настройки» (добавить недостающие ключи)
+  python -m google_sheets seed-settings --refresh — обновить структуру и описания, значения сохранить
+  python -m google_sheets seed-settings --force    — перезаписать настройки целиком
+  python -m google_sheets seed-logs              — лист «логи ежедневного парсинга»
 """
 
 from __future__ import annotations
@@ -29,14 +30,22 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="для seed-settings: перезаписать настройки целиком",
+        help="для seed-settings: перезаписать настройки целиком (значения по умолчанию)",
+    )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="для seed-settings: новая структура и описания, текущие значения сохранить",
     )
     args = parser.parse_args()
 
     if args.command == "seed-settings":
         from google_sheets.settings import seed_settings_workbook
 
-        seed_settings_workbook(ROOT, force=args.force)
+        if args.force and args.refresh:
+            print("Укажите только один флаг: --force или --refresh.")
+            return 1
+        seed_settings_workbook(ROOT, force=args.force, refresh=args.refresh)
         return 0
 
     if args.command == "seed-logs":

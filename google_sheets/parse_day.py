@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from google_sheets.calendar import (
+    calendar_window_end,
     filter_availability_day_map,
     nights_in_interval,
     parse_booking_interval,
@@ -30,15 +31,21 @@ def write_cutoff_for_listing(day_at_start: date) -> date:
 
 
 def filter_booking_prices(booking: dict[str, str], cutoff: date) -> dict[str, str]:
-    """Оставить в карусели только периоды с ночами >= cutoff."""
+    """Оставить в карусели периоды с ночами >= cutoff и в окне двух месяцев."""
     if not booking:
         return {}
+    window_end = calendar_window_end(cutoff)
     out: dict[str, str] = {}
     for label, price in booking.items():
         pr = parse_booking_interval(label, cutoff)
         if not pr:
             continue
         s, e = pr
+        if s > window_end:
+            continue
+        last_night = min(e - timedelta(days=1), window_end)
+        if last_night < cutoff:
+            continue
         if nights_in_interval(s, e, cutoff):
             out[label] = price
     return out

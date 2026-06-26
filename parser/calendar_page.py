@@ -59,17 +59,17 @@ def open_calendar_popup(
     """Открыть datepicker. sheet_row — для совместимости API (в quiet без лишних логов)."""
     _ = sheet_row
     _ = item_id
-    if wait_datepicker_ready(page, timeout_ms=min(2000, ready_timeout_ms)):
+    if wait_datepicker_ready(page, timeout_ms=min(2000, ready_timeout_ms), min_panels=2):
         trigger = find_visible_calendar_trigger(page)
         page.wait_for_timeout(int(after_open_wait_s * 1000))
-        wait_datepicker_ready(page, timeout_ms=ready_timeout_ms, min_day_labels=14)
+        wait_datepicker_ready(page, timeout_ms=ready_timeout_ms, min_day_labels=14, min_panels=2)
         return trigger or CALENDAR_TRIGGER_SELECTORS[0]
 
     trigger = click_calendar_trigger(page)
     if not trigger:
         return None
     page.wait_for_timeout(int(after_open_wait_s * 1000))
-    if wait_datepicker_ready(page, timeout_ms=ready_timeout_ms):
+    if wait_datepicker_ready(page, timeout_ms=ready_timeout_ms, min_panels=2):
         return trigger
     if not quiet:
         try:
