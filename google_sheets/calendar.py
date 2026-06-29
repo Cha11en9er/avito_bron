@@ -15,7 +15,6 @@ from google_sheets.constants import (
     RE_PERIOD,
     RE_PERIOD_CROSS_MONTH,
     format_header_date,
-    parse_header_date,
 )
 from google_sheets.settings import ParserSettings
 
@@ -42,7 +41,7 @@ def calendar_window_months(today: date) -> set[tuple[int, int]]:
 
 
 def calendar_window_end(today: date) -> date:
-    """Последний день следующего месяца от today."""
+    """Последний день следующего месяца от today (окно datepicker: 2 месяца)."""
     y, m = today.year, today.month
     if m < 12:
         ny, nm = y, m + 1
@@ -51,9 +50,15 @@ def calendar_window_end(today: date) -> date:
     return date(ny, nm, cal_mod.monthrange(ny, nm)[1])
 
 
+def calendar_parse_window(today: date) -> tuple[date, date]:
+    """Интервал парсинга/записи: [today, конец следующего месяца]."""
+    return today, calendar_window_end(today)
+
+
 def filter_availability_day_map(day_map: dict[date, str], cutoff: date) -> dict[date, str]:
-    """Только даты >= cutoff (месяцы — из datepicker на карточке, не фильтруем здесь)."""
-    return {d: v for d, v in (day_map or {}).items() if d >= cutoff}
+    """Даты в окне datepicker от cutoff до конца следующего месяца."""
+    _, end = calendar_parse_window(cutoff)
+    return {d: v for d, v in (day_map or {}).items() if cutoff <= d <= end}
 
 
 def month_from_russian(word: str) -> int | None:
@@ -94,8 +99,9 @@ def parse_period_dates(label: str, year: int) -> tuple[date, date] | None:
     m = RE_PERIOD_CROSS_MONTH.match(text)
     if m:
         d1, mon1, d2, mon2 = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        y2 = year if mon2 >= mon1 else year + 1
         try:
-            return date(year, mon1, d1), date(year, mon2, d2)
+            return date(year, mon1, d1), date(y2, mon2, d2)
         except ValueError:
             return None
 
@@ -140,34 +146,60 @@ def parse_booking_interval(label: str, today: date) -> tuple[date, date] | None:
     return s, e
 
 
-def header_year_for_calendar(today: date, header_samples: list[date], fallback_year: int) -> int:
-    y = today.year
-    if not header_samples:
-        return fallback_year
-    for hd in header_samples[:3]:
+def _resolve_header_cell_date(
+    day: int,
+    month: int,
+    today: date,
+    prev: date | None,
+) -> date | None:
+    """Год для заголовка ДД.ММ — из today и соседних столбцов (январь после декабря и т.д.)."""
+    candidates: list[date] = []
+    for y in (today.year - 1, today.year, today.year + 1):
         try:
-            dt = date(y, hd.month, hd.day)
+            candidates.append(date(y, month, day))
         except ValueError:
             continue
-        if dt < today - timedelta(days=200):
-            return today.year + 1
-    return y
+    if not candidates:
+        return None
+    if prev is not None:
+        forward = [c for c in candidates if c >= prev - timedelta(days=5)]
+        if forward:
+            return min(
+                forward,
+                key=lambda c: (c - prev).days if c >= prev else 10_000 + (prev - c).days,
+            )
+    in_range = [
+        c
+        for c in candidates
+        if today - timedelta(days=400) <= c <= today + timedelta(days=400)
+    ]
+    if in_range:
+        return min(in_range, key=lambda c: abs((c - today).days))
+    return min(candidates, key=lambda c: abs((c - today).days))
 
 
 def build_header_date_map(headers: list[str], today: date, fallback_year: int) -> dict[date, int]:
-    samples: list[date] = []
-    for h in headers[1:]:
-        d0 = parse_header_date(h, today.year)
-        if d0:
-            samples.append(d0)
-    year = header_year_for_calendar(today, samples, fallback_year)
+    """Столбцы ДД.ММ → date; год выводится динамически (не привязан к calendar_start_year)."""
+    from google_sheets.constants import RE_HEADER_DAY
+
     col_by: dict[date, int] = {}
+    prev: date | None = None
+    year_hint = max(fallback_year, today.year)
     for j, h in enumerate(headers):
         if j == 0:
             continue
-        d = parse_header_date(h, year)
-        if d:
-            col_by[d] = j + 1
+        m = RE_HEADER_DAY.match((h or "").strip())
+        if not m:
+            continue
+        day_n, month_n = int(m.group(1)), int(m.group(2))
+        d = _resolve_header_cell_date(day_n, month_n, today, prev)
+        if d is None:
+            try:
+                d = date(year_hint, month_n, day_n)
+            except ValueError:
+                continue
+        col_by[d] = j + 1
+        prev = d
     return col_by
 
 
@@ -355,13 +387,13 @@ def open_calendar_ws(sh: Any, settings: ParserSettings, *, availability: bool) -
 
 
 def removed_listing_dates(today: date, forward_days: int | None = None) -> set[date]:
-    """Дни для «нету на сайте»: от today до конца следующего месяца (как у живого datepicker)."""
+    """Дни для «нету на сайте»: от today до конца окна datepicker (текущий + след. месяц)."""
     if forward_days is not None:
         n = max(1, forward_days)
         return {today + timedelta(days=i) for i in range(n)}
-    end = calendar_window_end(today)
+    start, end = calendar_parse_window(today)
     out: set[date] = set()
-    d = today
+    d = start
     while d <= end:
         out.add(d)
         d += timedelta(days=1)
@@ -385,6 +417,34 @@ def _read_row_values_by_date(
     return out
 
 
+def _is_preserved_calendar_cell(val: str | None, *, availability: bool) -> bool:
+    """При «нету на сайте» не затираем занятые дни (1) и реальные цены."""
+    s = (val or "").strip()
+    if not s or s == NOT_FOUND_ON_SITE:
+        return False
+    if availability:
+        return s == "1"
+    return True
+
+
+def _build_removed_day_map(
+    needed_dates: set[date],
+    col_by: dict[date, int],
+    existing: dict[date, str],
+    *,
+    availability: bool,
+) -> dict[date, str]:
+    """«Нету на сайте» только в пустые ячейки; 0/1 и цены сохраняются."""
+    out: dict[date, str] = {}
+    for d in needed_dates:
+        if d not in col_by:
+            continue
+        if _is_preserved_calendar_cell(existing.get(d), availability=availability):
+            continue
+        out[d] = NOT_FOUND_ON_SITE
+    return out
+
+
 def _extend_live_day_map_after_not_found(
     day_map: dict[date, str],
     col_by_date: dict[date, int],
@@ -392,8 +452,9 @@ def _extend_live_day_map_after_not_found(
     today: date,
 ) -> dict[date, str]:
     """
-    Объявление снова на сайте: с today — 0/1/цена/пусто;
-    даты < today с «нету на сайте» в day_map не попадают (сохраняются на листе).
+    Объявление снова на сайте:
+    - даты < today с «нету на сайте» не трогаем (история периода отсутствия);
+    - с today: снимаем «нету на сайте» пустой ячейкой и пишем 0/1/цену из парсинга.
     """
     out = dict(day_map)
     for d in col_by_date:
@@ -414,6 +475,7 @@ def _batch_updates_for_row(
     *,
     allow_past: bool = False,
     existing_by_date: dict[date, str] | None = None,
+    availability: bool = True,
 ) -> list[dict[str, Any]]:
     from gspread.utils import rowcol_to_a1
 
@@ -424,12 +486,37 @@ def _batch_updates_for_row(
                 continue
             if existing_by_date and existing_by_date.get(d) == NOT_FOUND_ON_SITE:
                 continue
+        if (
+            val == NOT_FOUND_ON_SITE
+            and existing_by_date
+            and _is_preserved_calendar_cell(existing_by_date.get(d), availability=availability)
+        ):
+            continue
         col = col_by_date.get(d)
         if not col:
             continue
         a1 = rowcol_to_a1(row, col)
         body.append({"range": a1, "values": [[val]]})
     return body
+
+
+def _sync_booking_dates_after_availability(
+    listing_url: str,
+    old_availability: dict[date, str],
+    new_availability: dict[date, str],
+    col_by: dict[date, int],
+    today: date,
+) -> int:
+    from google_sheets.booking_dates import update_booking_dates_row
+    from google_sheets.sheet_session import get_parse_sheet_context
+
+    ctx = get_parse_sheet_context()
+    if ctx is None or ctx.booking_dates is None:
+        return 0
+    bd_col = ctx.booking_dates.ensure_dates(set(col_by.keys()) | set(new_availability.keys()), today)
+    return update_booking_dates_row(
+        ctx.booking_dates, listing_url, old_availability, new_availability, bd_col, today
+    )
 
 
 def _update_availability_cached(
@@ -451,7 +538,7 @@ def _update_availability_cached(
     values = _extend_live_day_map_after_not_found(day_map, col_by, existing_by_date, today)
 
     updates = _batch_updates_for_row(
-        row, col_by, values, today, existing_by_date=existing_by_date
+        row, col_by, values, today, existing_by_date=existing_by_date, availability=True
     )
     if not updates:
         return 0, "нечего писать"
@@ -460,6 +547,9 @@ def _update_availability_cached(
         ws.batch_update(updates, value_input_option="USER_ENTERED")
 
     api_retry(_do_batch)
+    _sync_booking_dates_after_availability(
+        listing_url, existing_by_date, values, col_by, today
+    )
     return len(updates), "ок"
 
 
@@ -482,7 +572,7 @@ def _update_calendar_sheet_cached(
         col_by = cache.ensure_dates(needed_removed, today)
         if not col_by:
             return 0, "нет столбцов дат"
-        day_map = {d: NOT_FOUND_ON_SITE for d in needed_removed if d in col_by}
+        day_map: dict[date, str] | None = None
     elif not slots:
         return 0, "нет слотов брони"
     else:
@@ -497,7 +587,11 @@ def _update_calendar_sheet_cached(
     _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
 
     existing_by_date = _read_row_values_by_date(ws, row, col_by)
-    if not listing_removed:
+    if listing_removed:
+        day_map = _build_removed_day_map(
+            needed_removed, col_by, existing_by_date, availability=availability
+        )
+    else:
         day_map = _extend_live_day_map_after_not_found(
             day_map, col_by, existing_by_date, today
         )
@@ -507,8 +601,8 @@ def _update_calendar_sheet_cached(
         col_by,
         day_map,
         today,
-        allow_past=listing_removed,
         existing_by_date=existing_by_date,
+        availability=availability,
     )
     if not updates:
         return 0, "нечего писать"
@@ -517,6 +611,10 @@ def _update_calendar_sheet_cached(
         ws.batch_update(updates, value_input_option="USER_ENTERED")
 
     api_retry(_do_batch)
+    if availability and not listing_removed:
+        _sync_booking_dates_after_availability(
+            listing_url, existing_by_date, day_map, col_by, today
+        )
     return len(updates), "ок"
 
 
@@ -555,7 +653,7 @@ def update_availability_day_map(
     values = _extend_live_day_map_after_not_found(day_map, col_by, existing_by_date, today)
 
     updates = _batch_updates_for_row(
-        row, col_by, values, today, existing_by_date=existing_by_date
+        row, col_by, values, today, existing_by_date=existing_by_date, availability=True
     )
     if not updates:
         return 0, "нечего писать"
@@ -564,6 +662,9 @@ def update_availability_day_map(
         ws.batch_update(updates, value_input_option="USER_ENTERED")
 
     api_retry(_do_batch)
+    _sync_booking_dates_after_availability(
+        listing_url, existing_by_date, values, col_by, today
+    )
     return len(updates), "ок"
 
 
@@ -606,9 +707,7 @@ def update_calendar_sheet(
         col_by = ensure_calendar_headers(ws, needed_removed, today, settings)
         if not col_by:
             return 0, "нет столбцов дат"
-        day_map = {
-            d: NOT_FOUND_ON_SITE for d in needed_removed if d in col_by
-        }
+        day_map = None
     elif not slots:
         return 0, "нет слотов брони"
     else:
@@ -617,14 +716,23 @@ def update_calendar_sheet(
         if not day_map:
             return 0, "нечего писать"
 
-    needed = dates_from_slots(slots, today) if slots and not listing_removed else set(day_map.keys())
-    col_by = ensure_calendar_headers(ws, needed, today, settings)
+    needed = (
+        dates_from_slots(slots, today)
+        if slots and not listing_removed
+        else (needed_removed if listing_removed else set(day_map.keys()))
+    )
+    if not listing_removed:
+        col_by = ensure_calendar_headers(ws, needed, today, settings)
 
     row = find_row_by_url_col_a(ws, listing_url)
     _ensure_row_with_url(ws, row, listing_url, max(_last_date_column(col_by), len(headers)))
 
     existing_by_date = _read_row_values_by_date(ws, row, col_by)
-    if not listing_removed:
+    if listing_removed:
+        day_map = _build_removed_day_map(
+            needed_removed, col_by, existing_by_date, availability=availability
+        )
+    else:
         day_map = _extend_live_day_map_after_not_found(
             day_map, col_by, existing_by_date, today
         )
@@ -634,8 +742,8 @@ def update_calendar_sheet(
         col_by,
         day_map,
         today,
-        allow_past=listing_removed,
         existing_by_date=existing_by_date,
+        availability=availability,
     )
     if not updates:
         return 0, "нечего писать"

@@ -138,6 +138,37 @@ def canon_url(u: str) -> str:
     return s.split("?", 1)[0].strip().rstrip("/")
 
 
+def trim_worksheet_rows(ws: Any, keep_rows: int) -> int:
+    """Удалить строки ниже keep_rows (1-based, включая заголовок)."""
+    keep = max(1, keep_rows)
+    cur = getattr(ws, "row_count", 0) or 0
+    if cur <= keep:
+        return 0
+
+    sheet_id = ws.id
+
+    def _do() -> None:
+        ws.spreadsheet.batch_update(
+            {
+                "requests": [
+                    {
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": sheet_id,
+                                "dimension": "ROWS",
+                                "startIndex": keep,
+                                "endIndex": cur,
+                            }
+                        }
+                    }
+                ]
+            }
+        )
+
+    api_retry(_do)
+    return cur - keep
+
+
 def find_row_by_url_col_a(ws: Any, url: str) -> int:
     canon = canon_url(url)
     col_a = ws.col_values(1)

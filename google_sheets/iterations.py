@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 _queue_len: int = 0
+_logs_master_urls: list[str] = []
 
 
 def set_queue_len(n: int) -> None:
     global _queue_len
     _queue_len = max(0, n)
+
+
+def set_logs_master_urls(urls: list[str]) -> None:
+    global _logs_master_urls
+    _logs_master_urls = list(urls)
+
+
+def get_logs_master_urls() -> list[str]:
+    return _logs_master_urls
 
 
 def current_queue_len() -> int | None:
@@ -29,8 +40,8 @@ from google_sheets.client import (
     api_retry,
     canon_url,
     ensure_worksheet,
-    find_row_by_url_col_a,
     get_worksheet,
+    trim_worksheet_rows,
 )
 from google_sheets.constants import (
     LOG_STATUS_FAIL,
@@ -78,7 +89,7 @@ def assign_iteration_to_slot(settings: ParserSettings, iteration_number: int) ->
     from dataclasses import replace
 
     slot = iteration_slot_index(iteration_number)
-    ids = slot_iteration_ids(settings)
+    ids = list(slot_iteration_ids(settings))
     ids[slot] = iteration_number
     return replace(
         settings,
@@ -88,83 +99,201 @@ def assign_iteration_to_slot(settings: ParserSettings, iteration_number: int) ->
     )
 
 
-def rebuild_logs_sheet(base_dir: Path, settings: ParserSettings, sh: Any, urls: list[str]) -> Any:
-    """Полная пересборка листа логов: новый заголовок итераций + столбец URL."""
+def iteration_settings_payload(settings: ParserSettings) -> dict[str, str]:
+    it = max(1, settings.parse_iteration)
+    return {
+        "parse_iteration": str(it),
+        "iteration_progress": str(settings.iteration_progress),
+        "iteration_progress_for": str(max(1, settings.iteration_progress_for)),
+        "iteration_logs_cleared_for": str(settings.iteration_logs_cleared_for),
+        "iteration_slot_0": str(settings.iteration_slot_0),
+        "iteration_slot_1": str(settings.iteration_slot_1),
+        "iteration_slot_2": str(settings.iteration_slot_2),
+    }
+
+
+def persist_iteration_settings(sh: Any, settings: ParserSettings) -> None:
+    from google_sheets.settings import clear_settings_row_cache, save_settings_values
+
+    clear_settings_row_cache()
+    save_settings_values(sh, settings, iteration_settings_payload(settings))
+
+
+def reconcile_iteration_change(
+    settings: ParserSettings,
+    *,
+    announce: bool = False,
+) -> tuple[ParserSettings, bool]:
+    """
+    Единственный ручной рычаг — parse_iteration.
+    Если номер итерации сменился (≠ iteration_progress_for) — сброс прогресса и слотов логов.
+    """
+    from dataclasses import replace
+
+    it = max(1, settings.parse_iteration)
+    prog_for = max(1, settings.iteration_progress_for)
+    if prog_for == it:
+        return assign_iteration_to_slot(settings, it), False
+
+    old_prog = settings.iteration_progress
+    settings = assign_iteration_to_slot(
+        replace(
+            settings,
+            parse_iteration=it,
+            iteration_progress=0,
+            iteration_progress_for=it,
+            iteration_logs_cleared_for=0,
+        ),
+        it,
+    )
+    if announce:
+        print(
+            f"Смена итерации {prog_for} → {it}: iteration_progress сброшен "
+            f"(было строка {old_prog or 2}); слоты логов {slot_iteration_ids(settings)}."
+        )
+    return settings, True
+
+
+RE_LOG_DATE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
+RE_LOG_TIME = re.compile(r"^\d{1,2}:\d{2}:\d{2}$")
+_LOG_STATUSES = frozenset({"ок", "фейл", "нет на сайте"})
+
+
+def _log_column_kind(col_1based: int) -> str:
+    """label | date | time | status для столбца внутри блока итерации."""
+    for slot in range(3):
+        base = slot_base_column(slot)
+        if col_1based == base:
+            return "label"
+        if col_1based == base + 1:
+            return "date"
+        if col_1based == base + 2:
+            return "time"
+        if col_1based == base + 3:
+            return "status"
+    return "other"
+
+
+def _looks_like_url(val: str) -> bool:
+    s = (val or "").strip().lower()
+    return s.startswith("http") or "avito.ru" in s
+
+
+def _sanitize_log_cell(val: str, kind: str) -> str:
+    """Не переносим в лог ссылки и прочий мусор из старых битых ячеек."""
+    s = (val or "").strip()
+    if not s or _looks_like_url(s):
+        return ""
+    if kind == "label":
+        return s if s.startswith("ит.") else ""
+    if kind == "date":
+        return s if RE_LOG_DATE.match(s) else ""
+    if kind == "time":
+        return s if RE_LOG_TIME.match(s) else ""
+    if kind == "status":
+        return s if s in _LOG_STATUSES else ""
+    return ""
+
+
+def _iteration_log_column_indices() -> list[int]:
+    """1-based: все колонки блоков итераций (ит., дата, время, статус) × 3 слота."""
+    cols: list[int] = []
+    for slot in range(3):
+        base = slot_base_column(slot)
+        cols.extend(range(base, base + COLS_PER_SLOT))
+    return cols
+
+
+def _find_url_in_row(row: list[str]) -> str:
+    """Канон URL только из столбца A (не из ячеек итераций)."""
+    if row:
+        return canon_url(row[0] or "")
+    return ""
+
+
+def _read_logs_rows_by_url(ws: Any) -> dict[str, list[str]]:
+    """Старые строки лога по canon URL (для переноса ячеек итераций)."""
+    rows = ws.get_all_values()
+    out: dict[str, list[str]] = {}
+    for row in rows[1:]:
+        c = _find_url_in_row(row)
+        if c and c not in out:
+            out[c] = row
+    return out
+
+
+def sync_logs_sheet(sh: Any, settings: ParserSettings, urls: list[str]) -> Any:
+    """
+    Лист логов = лист «ссылки» построчно: строка 2 → 1-я ссылка, без append и без лишних строк.
+    Столбец A — URL; блоки итераций в C–F / H–K / M–P.
+    """
     from gspread.utils import rowcol_to_a1
 
-    from google_sheets.links import load_url_list
+    from google_sheets.link_index import last_data_row
 
     if not urls:
-        urls = load_url_list(base_dir, settings, sh)
-    if not urls:
-        raise RuntimeError("Нет URL для листа логов (проверьте «ссылки» или «сдаваемость по дням»).")
+        return get_worksheet(sh, settings.sheet_logs)
 
-    ws = ensure_worksheet(sh, settings.sheet_logs, rows=max(3000, len(urls) + 5), cols=20)
+    n_urls = len(urls)
+    need_rows = last_data_row(n_urls)
     header = build_logs_header(settings)
-    body = [header]
+    ncols = len(header)
+
+    ws = ensure_worksheet(sh, settings.sheet_logs, rows=max(need_rows + 5, 3000), cols=20)
+    old_by_url = _read_logs_rows_by_url(ws)
+    log_cols = _iteration_log_column_indices()
+
+    body: list[list[str]] = [header]
     for url in urls:
-        body.append([url.strip()] + [""] * (len(header) - 1))
-    end = rowcol_to_a1(len(body), len(header))
+        c = canon_url(url)
+        old = old_by_url.get(c, [])
+        row = [url.strip()] + [""] * (ncols - 1)
+        if old:
+            for j in log_cols:
+                idx = j - 1
+                if idx >= len(old):
+                    continue
+                clean = _sanitize_log_cell(old[idx], _log_column_kind(j))
+                if clean:
+                    row[idx] = clean
+        body.append(row)
+
+    end = rowcol_to_a1(need_rows, ncols)
 
     def _write() -> None:
         ws.clear()
         ws.update(f"A1:{end}", body, value_input_option="USER_ENTERED")
 
     api_retry(_write)
-    print(
-        f"Лист «{settings.sheet_logs}» пересобран: {len(urls)} URL, "
-        f"блоки итераций {slot_iteration_ids(settings)} "
-        f"(текущая итерация {settings.parse_iteration})."
+    trimmed = trim_worksheet_rows(ws, need_rows)
+    set_logs_master_urls(urls)
+    msg = (
+        f"Лист «{settings.sheet_logs}»: {n_urls} строк (как «{settings.sheet_links}»), "
+        f"блоки {slot_iteration_ids(settings)}."
     )
+    if trimmed:
+        msg += f" Удалено лишних строк: {trimmed}."
+    print(msg)
     return ws
+
+
+def rebuild_logs_sheet(base_dir: Path, settings: ParserSettings, sh: Any, urls: list[str]) -> Any:
+    """Полная пересборка листа логов (то же, что sync_logs_sheet)."""
+    from google_sheets.links import load_logs_master_urls
+
+    if not urls:
+        urls = load_logs_master_urls(base_dir, settings, sh)
+    if not urls:
+        raise RuntimeError("Нет URL для листа логов (проверьте «ссылки»).")
+    return sync_logs_sheet(sh, settings, urls)
 
 
 def ensure_logs_sheet(sh: Any, settings: ParserSettings, urls: list[str]) -> Any:
-    from gspread.utils import rowcol_to_a1
-
-    ws = ensure_worksheet(sh, settings.sheet_logs, rows=max(3000, len(urls) + 5), cols=20)
-    header = build_logs_header(settings)
-    rows = ws.get_all_values()
-
-    if not rows or (rows[0][0] if rows[0] else "") != "Объявление":
-        body = [header]
-        for url in urls:
-            body.append([url.strip()] + [""] * (len(header) - 1))
-        end = rowcol_to_a1(len(body), len(header))
-
-        def _init() -> None:
-            ws.clear()
-            ws.update(f"A1:{end}", body, value_input_option="USER_ENTERED")
-
-        api_retry(_init)
-        print(f"Лист «{settings.sheet_logs}»: заголовки итераций {slot_iteration_ids(settings)}.")
-        return ws
-
-    if rows[0] != header:
-        old_rows = rows[1:]
-        body = [header]
-        for row in old_rows:
-            url = row[0] if row else ""
-            padded = [url] + [""] * (len(header) - 1)
-            for j in range(1, min(len(row), len(padded))):
-                padded[j] = row[j]
-            body.append(padded)
-        end = rowcol_to_a1(len(body), len(header))
-
-        def _hdr() -> None:
-            ws.update(f"A1:{end}", body, value_input_option="USER_ENTERED")
-
-        api_retry(_hdr)
-
-    col_a = ws.col_values(1)
-    existing = {canon_url(c) for c in col_a[1:] if c}
-    to_add = [[u.strip()] + [""] * (len(header) - 1) for u in urls if canon_url(u) not in existing]
-    if to_add:
-        def _append() -> None:
-            ws.append_rows(to_add, value_input_option="USER_ENTERED")
-
-        api_retry(_append)
-    return ws
+    """Совместимость: синхронизация с мастер-списком ссылок."""
+    master = get_logs_master_urls()
+    if master:
+        return sync_logs_sheet(sh, settings, master)
+    return sync_logs_sheet(sh, settings, urls)
 
 
 def _slot_columns(settings: ParserSettings, iteration_number: int) -> tuple[int, int, int]:
@@ -238,21 +367,39 @@ def write_log_entry(
     *,
     status: str,
     ok: bool = True,
+    sheet_row: int | None = None,
 ) -> None:
     from gspread.utils import rowcol_to_a1
     from google_sheets.sheet_session import get_parse_sheet_context
 
     ctx = get_parse_sheet_context()
+    active_settings = ctx.settings if ctx is not None else settings
     if ctx is not None:
         ws = ctx.logs_ws
-        row = ctx.logs_index.find_row(listing_url)
     else:
-        ws = ensure_worksheet(sh, settings.sheet_logs, rows=3000, cols=20)
-        ensure_logs_sheet(sh, settings, [listing_url])
-        row = find_row_by_url_col_a(ws, listing_url)
+        ws = ensure_worksheet(sh, active_settings.sheet_logs, rows=3000, cols=20)
 
-    it = max(1, settings.parse_iteration)
-    col_date, col_time, col_status = _slot_columns(settings, it)
+    row: int | None = None
+    c = canon_url(listing_url)
+    if ctx is not None:
+        row = ctx.logs_index.row_for(listing_url)
+    if row is None and c:
+        master = get_logs_master_urls()
+        for i, u in enumerate(master):
+            if canon_url(u) == c:
+                row = index_to_row(i)
+                break
+    if row is None:
+        row = sheet_row
+    if row is None or row < FIRST_DATA_ROW:
+        print(
+            f"  лог: пропуск (нет строки для URL, row={row}) "
+            f"{listing_url[:60]}…"
+        )
+        return
+
+    it = max(1, active_settings.parse_iteration)
+    col_date, col_time, col_status = _slot_columns(active_settings, it)
     now = datetime.now(tz_moscow())
     date_str = now.strftime("%d.%m.%Y")
     time_str = now.strftime("%H:%M:%S")
@@ -454,26 +601,25 @@ def begin_iteration(
 ) -> ParserSettings:
     from dataclasses import replace
 
+    settings, user_changed = reconcile_iteration_change(settings, announce=True)
     it = max(1, settings.parse_iteration)
-    settings = assign_iteration_to_slot(settings, it)
+
+    if settings.run_calendar:
+        master = get_logs_master_urls() or list(urls or [])
+        if master:
+            sync_logs_sheet(sh, settings, master)
 
     if settings.run_calendar and _should_clear_logs_slot(settings, it):
-        if urls:
-            ensure_logs_sheet(sh, settings, urls)
         clear_iteration_slot_logs(sh, settings, it)
         settings = replace(settings, iteration_logs_cleared_for=it)
 
-    save_settings_values(
-        sh,
-        settings,
-        {
-            "parse_iteration": str(it),
-            "iteration_slot_0": str(settings.iteration_slot_0),
-            "iteration_slot_1": str(settings.iteration_slot_1),
-            "iteration_slot_2": str(settings.iteration_slot_2),
-            "iteration_logs_cleared_for": str(settings.iteration_logs_cleared_for),
-        },
-    )
+    persist_iteration_settings(sh, settings)
+
+    if user_changed:
+        print(
+            f"В настройках синхронизированы iteration_* для итерации {it} "
+            f"(менять вручную нужно только parse_iteration)."
+        )
     return settings
 
 
@@ -484,28 +630,17 @@ def complete_iteration(sh: Any, settings: ParserSettings, *, total_links: int) -
     old_it = max(1, settings.parse_iteration)
     new_it = old_it + 1
     settings = assign_iteration_to_slot(replace(settings, parse_iteration=new_it), new_it)
-    save_settings_values(
-        sh,
-        settings,
-        {
-            "parse_iteration": str(new_it),
-            "iteration_progress": "0",
-            "iteration_progress_for": str(new_it),
-            "iteration_logs_cleared_for": "0",
-            "iteration_slot_0": str(settings.iteration_slot_0),
-            "iteration_slot_1": str(settings.iteration_slot_1),
-            "iteration_slot_2": str(settings.iteration_slot_2),
-        },
-    )
-    print(
-        f"Итерация {old_it} завершена ({total_links} ссылок). "
-        f"В настройках: parse_iteration={new_it}, iteration_progress=0 "
-        f"(следующий запуск — со строки 2)."
-    )
-    return replace(
+    updated = replace(
         settings,
         parse_iteration=new_it,
         iteration_progress=0,
         iteration_progress_for=new_it,
         iteration_logs_cleared_for=0,
     )
+    persist_iteration_settings(sh, updated)
+    print(
+        f"Итерация {old_it} завершена ({total_links} ссылок). "
+        f"В настройках: parse_iteration={new_it}, iteration_progress=0 "
+        f"(следующий запуск — со строки 2)."
+    )
+    return updated

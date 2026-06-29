@@ -9,14 +9,14 @@ DEFAULT_SPREADSHEET_ID = "1vRF638f9LOKc8qkwTnjevUNYzT3VTKa4TY_kbULxjOg"
 DEFAULT_WORKSHEET_DETAIL = "детальная информация"
 DEFAULT_WORKSHEET_AVAILABILITY = "сдаваемость по дням"
 DEFAULT_WORKSHEET_PRICES_DAYS = "цены по дням"
+DEFAULT_WORKSHEET_BOOKING_DATES = "даты бронирования"
 DEFAULT_WORKSHEET_LINKS = "ссылки"
 DEFAULT_WORKSHEET_SETTINGS = "настройки"
 DEFAULT_WORKSHEET_LOGS = "логи ежедневного парсинга"
 DEFAULT_WORKSHEET_KADASTR = "детальная информация с кадастрами"
 
 NOT_FOUND_ON_SITE = "нету на сайте"
-# Снято с сайта: заполняем всё окно datepicker (текущий + след. месяц), см. removed_listing_dates.
-REMOVED_LISTING_FORWARD_DAYS = 4
+# Снято с сайта: окно datepicker = от today до конца следующего месяца (см. removed_listing_dates).
 # Маркер в booking[период]: слот на сайте без цены (занято / есть бронь)
 BOOKED_SLOT_MARKER = "__booked__"
 LOG_STATUS_OK = "ок"
@@ -49,6 +49,9 @@ REMOVED_TITLE_MARKERS = (
     "объявление не посмотреть",
     "объявление снято",
     "объявление не найдено",
+    "объявление истекло",
+    "объявление удалено",
+    "пользователь его удалил",
     "страница не найдена",
 )
 

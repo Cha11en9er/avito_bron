@@ -14,6 +14,7 @@ class PendingListingSync:
     listing_url: str
     removed: bool = False
     queue_next_row: int | None = None
+    log_sheet_row: int | None = None
     availability_days: dict[date, str] | None = None
     sheet_today: date | None = None
     attempts: int = 0

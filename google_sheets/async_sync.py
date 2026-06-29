@@ -116,6 +116,7 @@ class AsyncSheetSyncWorker:
             item.listing_url,
             removed=item.removed,
             queue_next_index=None,
+            log_sheet_row=item.log_sheet_row,
             availability_days=item.availability_days if not item.removed else None,
             today=item.sheet_today,
             save_progress=False,

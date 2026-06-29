@@ -79,6 +79,13 @@ def load_url_list(base_dir: Path, settings: ParserSettings, sh: Any) -> list[str
     return apply_link_range(urls, settings)
 
 
+def load_logs_master_urls(base_dir: Path, settings: ParserSettings, sh: Any) -> list[str]:
+    """Полный список URL для листа логов (без detail_range — как лист «ссылки»)."""
+    if settings.sync_from_links_sheet:
+        return load_urls_from_links_sheet(base_dir, settings, sh=sh)
+    return load_urls_from_calendar_sheet(sh, settings)
+
+
 def remove_orphan_urls_from_worksheet(ws: Any, allowed_canon: set[str]) -> int:
     """Удалить строки с URL, которых нет в списке «ссылки» (реальное смещение строк)."""
     rows = orphan_url_row_indices(ws, allowed_canon)
@@ -98,6 +105,7 @@ def remove_orphan_urls_from_work_sheets(
     targets = (
         settings.sheet_availability,
         settings.sheet_prices,
+        settings.sheet_booking_dates,
         settings.sheet_logs,
         settings.sheet_detail,
     )
@@ -168,7 +176,9 @@ def ensure_urls_on_work_sheets(
     if include_detail:
         targets.append(settings.sheet_detail)
     if include_calendar:
-        targets.extend([settings.sheet_availability, settings.sheet_prices])
+        targets.extend(
+            [settings.sheet_availability, settings.sheet_prices, settings.sheet_booking_dates]
+        )
     if include_logs:
         targets.append(settings.sheet_logs)
     for title in targets:
@@ -194,6 +204,10 @@ def prepare_workbook(
         if settings.calendar_mode == "primary" and settings.run_calendar:
             init_calendar_sheet(sh, settings, settings.sheet_availability, full_links)
             init_calendar_sheet(sh, settings, settings.sheet_prices, full_links)
+    if settings.run_calendar and all_urls:
+        from google_sheets.booking_dates import ensure_booking_dates_sheet
+
+        ensure_booking_dates_sheet(sh, settings, all_urls)
 
 
 def build_parse_queue(
@@ -217,6 +231,11 @@ def build_parse_queue(
     )
 
     sync_kw = {"links_master": links_master} if links_master is not None else {}
+    logs_master = links_master if links_master is not None else all_urls
+    if settings.run_calendar and logs_master:
+        from google_sheets.iterations import sync_logs_sheet
+
+        sync_logs_sheet(sh, settings, logs_master)
 
     if settings.run_calendar and not settings.run_detail:
         if settings.sync_from_links_sheet:
@@ -226,7 +245,7 @@ def build_parse_queue(
                 all_urls,
                 include_detail=False,
                 include_calendar=True,
-                include_logs=True,
+                include_logs=False,
                 **sync_kw,
             )
         print(f"Календарь: к парсингу {len(all_urls)}.")
@@ -240,7 +259,7 @@ def build_parse_queue(
                 all_urls,
                 include_detail=True,
                 include_calendar=True,
-                include_logs=True,
+                include_logs=False,
                 **sync_kw,
             )
         queue = _filter_detail_queue(sh, settings, all_urls)
@@ -255,7 +274,7 @@ def build_parse_queue(
                 all_urls,
                 include_detail=True,
                 include_calendar=False,
-                include_logs=settings.run_calendar,
+                include_logs=False,
                 **sync_kw,
             )
         queue = _filter_detail_queue(sh, settings, all_urls)

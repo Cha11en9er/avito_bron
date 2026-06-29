@@ -24,7 +24,6 @@ from google_sheets.detail import (
 from google_sheets.iterations import (
     begin_iteration,
     complete_iteration,
-    ensure_logs_sheet,
     save_iteration_progress,
     slice_queue_for_resume,
     write_log_entry,
@@ -43,6 +42,33 @@ def is_listing_removed(title: str, record: dict[str, object] | None = None) -> b
         if "не посмотреть" in name:
             return True
     return False
+
+
+def _write_calendar_not_found_window(
+    sh: Any,
+    settings: ParserSettings,
+    listing_url: str,
+    today: date,
+) -> tuple[int, int]:
+    """«Нету на сайте» в окне [today … конец след. месяца]; единицы и цены не трогаем."""
+    av_n, _ = update_calendar_sheet(
+        sh, settings, settings.sheet_availability, listing_url, {}, today,
+        "availability", listing_removed=True,
+    )
+    pr_n, _ = update_calendar_sheet(
+        sh, settings, settings.sheet_prices, listing_url, {}, today,
+        "prices", listing_removed=True,
+    )
+    return av_n, pr_n
+
+
+def _has_calendar_parse_data(
+    availability_days: dict[date, str] | None,
+    booking_prices: dict[str, str],
+    av_n: int,
+    pr_n: int,
+) -> bool:
+    return av_n > 0 or pr_n > 0 or bool(booking_prices) or bool(availability_days)
 
 
 def _should_write_detail(sh: Any, settings: ParserSettings, listing_url: str) -> bool:
@@ -66,6 +92,7 @@ def sync_after_listing(
     *,
     removed: bool = False,
     queue_next_index: int | None = None,  # номер следующей ссылки (1-based)
+    log_sheet_row: int | None = None,
     availability_days: dict[date, str] | None = None,
     today: date | None = None,
     save_progress: bool = True,
@@ -118,12 +145,17 @@ def sync_after_listing(
             pr_n, _ = update_calendar_sheet(
                 sh, settings, settings.sheet_prices, listing_url, booking_prices, sheet_today, "prices",
             )
-            ok = av_n > 0 or pr_n > 0 or bool(booking_prices) or bool(availability_days)
-            if not ok:
-                log_status = "фейл"
+            if _has_calendar_parse_data(availability_days, booking_prices, av_n, pr_n):
+                log_status = "ок"
+            else:
+                _write_calendar_not_found_window(sh, settings, listing_url, sheet_today)
+                log_status = "нет на сайте"
+                print("  запись в таблицу: нет на сайте (нет дат/цен в окне)")
 
     if settings.run_calendar:
-        write_log_entry(sh, settings, listing_url, status=log_status, ok=ok)
+        write_log_entry(
+            sh, settings, listing_url, status=log_status, ok=ok, sheet_row=log_sheet_row
+        )
 
     if queue_next_index is not None and save_progress:
         from google_sheets.iterations import current_queue_len
@@ -149,6 +181,7 @@ def sync_after_listing_calendar(
     *,
     removed: bool = False,
     queue_next_index: int | None = None,  # номер следующей ссылки (1-based)
+    log_sheet_row: int | None = None,
     today: date | None = None,
 ) -> tuple[bool, str]:
     """Сдаваемость из datepicker (2 мес.), цены — из карусели «ближайшие даты»."""
@@ -176,12 +209,17 @@ def sync_after_listing_calendar(
         pr_n, _ = update_calendar_sheet(
             sh, settings, settings.sheet_prices, listing_url, booking_prices, sheet_today, "prices",
         )
-        ok = av_n > 0 or pr_n > 0 or bool(booking_prices) or bool(availability_days)
-        if not ok:
-            log_status = "фейл"
+        if _has_calendar_parse_data(availability_days, booking_prices, av_n, pr_n):
+            log_status = "ок"
+        else:
+            _write_calendar_not_found_window(sh, settings, listing_url, sheet_today)
+            log_status = "нет на сайте"
+            print("  запись в таблицу: нет на сайте (нет дат/цен в окне)")
 
     if settings.run_calendar:
-        write_log_entry(sh, settings, listing_url, status=log_status, ok=ok)
+        write_log_entry(
+            sh, settings, listing_url, status=log_status, ok=ok, sheet_row=log_sheet_row
+        )
 
     if queue_next_index is not None:
         from google_sheets.iterations import current_queue_len
@@ -199,18 +237,10 @@ def prepare_parse_session(
 ) -> tuple[Any, ParserSettings, list[str], int, int]:
     sh = open_spreadsheet(base_dir)
     settings = load_settings(base_dir, sh)
-    sh = open_spreadsheet(base_dir)
-    settings = load_settings(base_dir, sh)
 
     sh, full_queue = build_parse_queue(base_dir, settings, export_columns)
-    settings = load_settings(base_dir, sh)
-
-    if settings.run_calendar and full_queue:
-        ensure_logs_sheet(sh, settings, full_queue)
 
     settings = begin_iteration(sh, settings, urls=full_queue if full_queue else None)
-    if settings.run_calendar and full_queue:
-        ensure_logs_sheet(sh, settings, full_queue)
 
     from google_sheets.iterations import set_queue_len
 

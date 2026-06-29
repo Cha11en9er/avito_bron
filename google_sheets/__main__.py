@@ -51,14 +51,12 @@ def main() -> int:
     if args.command == "seed-logs":
         from google_sheets.client import open_spreadsheet
         from google_sheets.iterations import rebuild_logs_sheet
-        from google_sheets.links import load_url_list
+        from google_sheets.links import load_logs_master_urls
         from google_sheets.settings import load_settings
 
         sh = open_spreadsheet(ROOT)
         settings = load_settings(ROOT, sh)
-        sh = open_spreadsheet(ROOT)
-        settings = load_settings(ROOT, sh)
-        urls = load_url_list(ROOT, settings, sh)
+        urls = load_logs_master_urls(ROOT, settings, sh)
         rebuild_logs_sheet(ROOT, settings, sh, urls)
         return 0
 

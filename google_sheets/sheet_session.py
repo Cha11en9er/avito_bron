@@ -14,10 +14,9 @@ from google_sheets.calendar import (
     _worksheet_resize_cols,
     build_header_date_map,
     format_header_date,
-    open_calendar_ws,
     today_moscow,
 )
-from google_sheets.iterations import ensure_logs_sheet
+from google_sheets.iterations import get_logs_master_urls, sync_logs_sheet
 from google_sheets.settings import ParserSettings
 
 
@@ -25,6 +24,18 @@ from google_sheets.settings import ParserSettings
 class UrlRowIndex:
     canon_to_row: dict[str, int] = field(default_factory=dict)
     max_row: int = 1
+
+    @classmethod
+    def from_master_urls(cls, urls: list[str]) -> UrlRowIndex:
+        from google_sheets.link_index import FIRST_DATA_ROW
+
+        idx = cls()
+        for i, url in enumerate(urls):
+            c = canon_url(url)
+            if c:
+                idx.canon_to_row[c] = i + FIRST_DATA_ROW
+        idx.max_row = len(urls) + 1 if urls else 1
+        return idx
 
     @classmethod
     def from_col_a(cls, col_a: list[str]) -> UrlRowIndex:
@@ -37,6 +48,9 @@ class UrlRowIndex:
                 idx.canon_to_row[c] = i
         idx.max_row = max(len(col_a), 1)
         return idx
+
+    def row_for(self, url: str) -> int | None:
+        return self.canon_to_row.get(canon_url(url))
 
     def find_row(self, url: str) -> int:
         c = canon_url(url)
@@ -61,7 +75,14 @@ class CalendarWsCache:
 
     @classmethod
     def load(cls, sh: Any, settings: ParserSettings, *, availability: bool) -> CalendarWsCache:
-        ws = open_calendar_ws(sh, settings, availability=availability)
+        title = settings.sheet_availability if availability else settings.sheet_prices
+        return cls.load_for_title(sh, settings, title)
+
+    @classmethod
+    def load_for_title(cls, sh: Any, settings: ParserSettings, title: str) -> CalendarWsCache:
+        ws = get_worksheet(sh, title)
+        if ws is None:
+            ws = ensure_worksheet(sh, title, rows=3000, cols=26)
 
         def _headers() -> list[str]:
             return ws.row_values(1) or ["Объявление"]
@@ -111,6 +132,7 @@ class CalendarWsCache:
 class ParseSheetContext:
     availability: CalendarWsCache
     prices: CalendarWsCache
+    booking_dates: CalendarWsCache | None
     logs_ws: Any
     logs_index: UrlRowIndex
     settings: ParserSettings
@@ -131,16 +153,26 @@ def init_parse_sheet_context(
     skip_logs_ensure: bool = False,
 ) -> ParseSheetContext:
     urls = log_urls or []
-    if not skip_logs_ensure:
-        ensure_logs_sheet(sh, settings, urls)
+    master = get_logs_master_urls() or urls
+    if not skip_logs_ensure and master:
+        sync_logs_sheet(sh, settings, master)
     logs_ws = ensure_worksheet(sh, settings.sheet_logs, rows=3000, cols=20)
+    logs_index = (
+        UrlRowIndex.from_master_urls(master)
+        if master
+        else UrlRowIndex.from_col_a(api_retry(lambda: logs_ws.col_values(1)))
+    )
     availability = CalendarWsCache.load(sh, settings, availability=True)
     prices = CalendarWsCache.load(sh, settings, availability=False)
+    booking_dates: CalendarWsCache | None = None
+    if settings.run_calendar:
+        booking_dates = CalendarWsCache.load_for_title(sh, settings, settings.sheet_booking_dates)
     ctx = ParseSheetContext(
         availability=availability,
         prices=prices,
+        booking_dates=booking_dates,
         logs_ws=logs_ws,
-        logs_index=UrlRowIndex.from_col_a(api_retry(lambda: logs_ws.col_values(1))),
+        logs_index=logs_index,
         settings=settings,
     )
     _tls.ctx = ctx

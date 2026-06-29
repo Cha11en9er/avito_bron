@@ -19,6 +19,17 @@ def _pause(page, min_s: float = 0.1, max_s: float = 0.25) -> None:
     page.wait_for_timeout(int(random.uniform(min_s, max_s) * 1000))
 
 
+def has_calendar_on_page(page) -> bool:
+    """Поле дат / триггер календаря есть в DOM (без долгого ожидания)."""
+    for sel in CALENDAR_TRIGGER_SELECTORS:
+        try:
+            if page.locator(sel).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def scroll_to_calendar(page) -> bool:
     """Прокрутка к полю дат / триггеру календаря."""
     for sel in CALENDAR_TRIGGER_SELECTORS:
@@ -36,15 +47,30 @@ def click_calendar_trigger(page) -> str | None:
     for sel in CALENDAR_TRIGGER_SELECTORS:
         loc = page.locator(sel).first
         try:
-            if loc.count() == 0 or not loc.is_visible(timeout=1500):
+            if loc.count() == 0 or not loc.is_visible(timeout=800):
                 continue
-            loc.scroll_into_view_if_needed(timeout=4000)
+            loc.scroll_into_view_if_needed(timeout=3500)
             _pause(page)
-            loc.click(timeout=8000)
+            loc.click(timeout=3500)
             return sel
         except Exception:
             continue
     return None
+
+
+def _datepicker_ready(
+    page,
+    timeout_ms: int,
+    *,
+    min_day_labels: int = 14,
+    min_panels: int = 2,
+) -> bool:
+    return wait_datepicker_ready(
+        page,
+        timeout_ms=timeout_ms,
+        min_day_labels=min_day_labels,
+        min_panels=min_panels,
+    )
 
 
 def open_calendar_popup(
@@ -56,22 +82,13 @@ def open_calendar_popup(
     ready_timeout_ms: int = 3500,
     quiet: bool = False,
 ) -> str | None:
-    """Открыть datepicker. sheet_row — для совместимости API (в quiet без лишних логов)."""
+    """Открыть datepicker. Возвращает селектор только если панели с днями догрузились."""
     _ = sheet_row
     _ = item_id
-    if wait_datepicker_ready(page, timeout_ms=min(2000, ready_timeout_ms), min_panels=2):
-        trigger = find_visible_calendar_trigger(page)
-        page.wait_for_timeout(int(after_open_wait_s * 1000))
-        wait_datepicker_ready(page, timeout_ms=ready_timeout_ms, min_day_labels=14, min_panels=2)
-        return trigger or CALENDAR_TRIGGER_SELECTORS[0]
 
-    trigger = click_calendar_trigger(page)
-    if not trigger:
-        return None
-    page.wait_for_timeout(int(after_open_wait_s * 1000))
-    if wait_datepicker_ready(page, timeout_ms=ready_timeout_ms, min_panels=2):
-        return trigger
-    if not quiet:
+    def _log_fail() -> None:
+        if quiet:
+            return
         try:
             panels = page.locator('[data-marker^="datepicker/calendar("]').count()
             days = page.locator(
@@ -80,6 +97,29 @@ def open_calendar_popup(
             print(f"  календарь не догрузился (панелей={panels}, дней={days})")
         except Exception:
             pass
+
+    if _datepicker_ready(page, timeout_ms=min(2000, ready_timeout_ms)):
+        trigger = find_visible_calendar_trigger(page)
+        page.wait_for_timeout(int(after_open_wait_s * 1000))
+        if _datepicker_ready(page, timeout_ms=ready_timeout_ms):
+            return trigger or CALENDAR_TRIGGER_SELECTORS[0]
+        _log_fail()
+        return None
+
+    for attempt in range(2):
+        trigger = click_calendar_trigger(page)
+        if not trigger:
+            continue
+        page.wait_for_timeout(int(after_open_wait_s * 1000))
+        if _datepicker_ready(page, timeout_ms=ready_timeout_ms):
+            return trigger
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(350)
+        except Exception:
+            pass
+
+    _log_fail()
     return None
 
 
