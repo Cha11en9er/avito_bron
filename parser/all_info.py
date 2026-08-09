@@ -154,12 +154,53 @@ def _console_utf8() -> None:
             pass
 
 
+def _playwright_proxy() -> dict[str, str] | None:
+    """
+    Прокси из .env (опционально).
+    Либо AVITO_PROXY_SERVER + USER/PASSWORD, либо одной строкой AVITO_PROXY=http://user:pass@host:port
+    """
+    raw = (os.getenv("AVITO_PROXY") or "").strip()
+    server = (os.getenv("AVITO_PROXY_SERVER") or "").strip()
+    user = (os.getenv("AVITO_PROXY_USER") or "").strip()
+    password = (os.getenv("AVITO_PROXY_PASSWORD") or "").strip()
+
+    if raw and not server:
+        from urllib.parse import urlparse
+
+        u = urlparse(raw if "://" in raw else f"http://{raw}")
+        if not u.hostname or not u.port:
+            print(f"Прокси: неверный AVITO_PROXY={raw!r}")
+            return None
+        scheme = u.scheme or "http"
+        proxy: dict[str, str] = {"server": f"{scheme}://{u.hostname}:{u.port}"}
+        if u.username:
+            proxy["username"] = u.username
+        if u.password:
+            proxy["password"] = u.password
+        return proxy
+
+    if not server:
+        return None
+    if "://" not in server:
+        server = f"http://{server}"
+    proxy = {"server": server}
+    if user:
+        proxy["username"] = user
+        proxy["password"] = password
+    return proxy
+
+
 def _launch_browser(playwright):
     """Как в avito-parser-exactly.py: системный Chrome, при отсутствии — bundled Chromium."""
+    kwargs: dict[str, Any] = {"headless": False, "args": CHROME_ARGS}
+    proxy = _playwright_proxy()
+    if proxy:
+        kwargs["proxy"] = proxy
+        print(f"Прокси: {proxy['server']}" + (" (с логином)" if proxy.get("username") else ""))
     try:
-        return playwright.chromium.launch(channel="chrome", headless=False, args=CHROME_ARGS)
+        return playwright.chromium.launch(channel="chrome", **kwargs)
     except Exception:
-        return playwright.chromium.launch(headless=False, args=CHROME_ARGS)
+        return playwright.chromium.launch(**kwargs)
 
 
 def _new_page(browser):
