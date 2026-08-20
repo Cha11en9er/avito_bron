@@ -60,6 +60,11 @@ CAPTCHA_PROGRESS_BACK_ROWS = 5
 DATEPICKER_READY_TIMEOUT_MS = 3500
 # После 10 успешно сохранённых объявлений — новый браузер (сессия не раздувается).
 BROWSER_RESTART_EVERY = 10
+AVITO_HOME_URL = "https://www.avito.ru/"
+# В начале каждой десятки: главная, без действий.
+HOME_WARMUP_S = 5.0
+# После перехода на объявление: не скроллить и не кликать.
+LISTING_SETTLE_S = 3.0
 URLS_FILE_NAME = "urls.txt"
 NOT_FOUND_VALUE = "нету на сайте"
 PHONE_NOT_RECOGNIZED = "не распознан"
@@ -247,6 +252,19 @@ def _pause_between_listings() -> None:
     if hi < lo:
         hi = lo
     time.sleep(random.uniform(lo, hi))
+
+
+def _warmup_avito_home(page) -> None:
+    """Открыть главную Avito и подождать — прогрев Chrome перед пачкой объявлений."""
+    print(f"прогрев Chrome: главная avito {HOME_WARMUP_S:.0f}с")
+    page.goto(AVITO_HOME_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    page.wait_for_timeout(int(HOME_WARMUP_S * 1000))
+
+
+def _settle_after_listing_goto(page) -> None:
+    """Пауза после захода на карточку: без скролла и кликов, иначе Avito чаще даёт капчу."""
+    print(f"  пауза {LISTING_SETTLE_S:.0f}с (без скролла и кликов)")
+    page.wait_for_timeout(int(LISTING_SETTLE_S * 1000))
 
 
 def _human_pause(page, min_seconds: float = 0.4, max_seconds: float = 1.6) -> None:
@@ -1459,6 +1477,7 @@ def _process_one_url(
     listing_started = time.monotonic()
     timings = _ListingTimings(listing_started)
     page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT_MS)
+    _settle_after_listing_goto(page)
     spa = _wait_initial_page_content(page)
     timings.add("загрузка", time.monotonic() - listing_started)
     timings._since = time.monotonic()
@@ -1750,6 +1769,12 @@ def main() -> None:
                     browser = _launch_browser(p)
                     context, page = _new_page(browser)
                     parsed_in_session = 0
+
+                if parsed_in_session == 0:
+                    try:
+                        _warmup_avito_home(page)
+                    except Exception as exc:
+                        print(f"прогрев Chrome: не удалось ({str(exc)[:80]})")
 
                 try:
                     record = _process_one_url(
